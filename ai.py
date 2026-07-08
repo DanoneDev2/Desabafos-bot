@@ -36,7 +36,7 @@ from groq import Groq
 import logger as log
 from config import Config
 from memory import GerenciadorDeMemoria
-from prompts import SYSTEM_PROMPT
+from google.genai import types
 from utils import calcular_backoff, eh_erro_contexto_muito_grande, eh_erro_retentavel
 
 
@@ -359,10 +359,10 @@ class ProvedorDeIA:
             resposta = self._cliente_gemini.models.generate_content(
                 model=self._config.model_name,
                 contents=conversa,
-                config={
-                    "system_instruction": SYSTEM_PROMPT,
-                    "temperature": self._config.temperature,
-                },
+                config=types.GenerateContentConfig(
+                   system_instruction=SYSTEM_PROMPT,
+                   temperature=self._config.temperature,
+                )
             )
 
             return (resposta.text or "").strip()
