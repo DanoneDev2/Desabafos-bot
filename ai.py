@@ -126,7 +126,7 @@ class ProvedorDeIA:
         self._groq_disponivel = bool(config.api_key_groq)
 
         if self._gemini_disponivel:
-           self._cliente_gemini = genai.Client(
+            self._cliente_gemini = genai.Client(
                 api_key=config.api_key_gemini
              )
         else:
@@ -204,7 +204,7 @@ class ProvedorDeIA:
     def _garantir_worker_ativo(self) -> None:
         """Inicia o worker da fila na primeira chamada (requer loop em execução)."""
         if not self._worker_iniciado:
-            asyncio.ensure_future(self._worker_loop())
+            asyncio.create_task(self._worker_loop())
             self._worker_iniciado = True
 
     async def _worker_loop(self) -> None:
