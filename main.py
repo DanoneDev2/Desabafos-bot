@@ -31,6 +31,10 @@ def main() -> None:
 
     db = Database(caminho_db=config.db_path, pasta_backup=config.db_backup_dir)
     bot = BotDeDesabafos(config, db)
+    
+log.info(f"Discord.py: {discord.__version__}")
+log.info(f"Canal: {config.canal_desabafos}")
+log.info(f"Token começa com: {config.token_discord[:10]}...")
 
     try:
         bot.run(config.token_discord, log_handler=None)
