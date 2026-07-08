@@ -365,7 +365,7 @@ class ProvedorDeIA:
                 },
             )
 
-            return resposta.text.strip()
+            return (resposta.text or "").strip()
 
         return await asyncio.to_thread(_chamada)
         
