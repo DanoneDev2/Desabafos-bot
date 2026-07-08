@@ -30,7 +30,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
-import google.generativeai as genai
+from google import genai
 from groq import Groq
 
 import logger as log
@@ -126,11 +126,9 @@ class ProvedorDeIA:
         self._groq_disponivel = bool(config.api_key_groq)
 
         if self._gemini_disponivel:
-            genai.configure(api_key=config.api_key_gemini)
-            self._modelo_gemini = genai.GenerativeModel(
-                model_name=config.model_name,
-                system_instruction=SYSTEM_PROMPT,
-            )
+        self._cliente_gemini = genai.Client(
+    api_key=config.api_key_gemini
+        )
         else:
             self._modelo_gemini = None
 
