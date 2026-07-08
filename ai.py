@@ -32,11 +32,12 @@ from typing import Awaitable, Callable, Optional
 
 from google import genai
 from groq import Groq
+from google.genai import types
 
 import logger as log
 from config import Config
 from memory import GerenciadorDeMemoria
-from google.genai import types
+from prompts import SYSTEM_PROMPT
 from utils import calcular_backoff, eh_erro_contexto_muito_grande, eh_erro_retentavel
 
 
