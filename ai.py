@@ -126,11 +126,11 @@ class ProvedorDeIA:
         self._groq_disponivel = bool(config.api_key_groq)
 
         if self._gemini_disponivel:
-        self._cliente_gemini = genai.Client(
-    api_key=config.api_key_gemini
-        )
-        else:
-            self._modelo_gemini = None
+    self._cliente_gemini = genai.Client(
+        api_key=config.api_key_gemini
+    )
+else:
+    self._cliente_gemini = None
 
         self._cliente_groq = Groq(api_key=config.api_key_groq) if self._groq_disponivel else None
 
@@ -335,16 +335,15 @@ class ProvedorDeIA:
 
     # ------------------------------------------------------------------
     # Implementações específicas de cada provedor
-    # ------------------------------------------------------------------
-
-    async def _gerar_com_gemini(
+    # -----------------------------------------------------------------
+async def _gerar_com_gemini(
     self,
     historico: list[dict[str, str]],
     nova_mensagem: str,
 ) -> str:
+    """Gera resposta usando o novo SDK google-genai."""
 
-    def _chamada():
-
+    def _chamada() -> str:
         conversa = ""
 
         for msg in historico:
@@ -359,17 +358,15 @@ class ProvedorDeIA:
             model=self._config.model_name,
             contents=conversa,
             config={
-                "temperature": self._config.temperature,
                 "system_instruction": SYSTEM_PROMPT,
+                "temperature": self._config.temperature,
             },
         )
+
         return resposta.text.strip()
 
     return await asyncio.to_thread(_chamada)
-            return resposta.text.strip()
-
-        return await asyncio.to_thread(_chamada_sincrona)
-
+    
     async def _gerar_com_groq(self, historico: list[dict[str, str]], nova_mensagem: str) -> str:
         """Gera resposta usando a API da Groq, como fallback."""
 
