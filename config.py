@@ -49,8 +49,8 @@ class Config:
     # IA
     api_key_gemini: str = field(default_factory=lambda: os.getenv("API_KEY_GEMINI", os.getenv("API_KEY_IA", "")))
     api_key_groq: str = field(default_factory=lambda: os.getenv("API_KEY_GROQ", ""))
-    model_name: str = field(default_factory=lambda: os.getenv("MODEL_NAME", "gemini-1.5-flash"))
-    groq_model_name: str = field(default_factory=lambda: os.getenv("GROQ_MODEL_NAME", "llama-3.1-70b-versatile"))
+    model_name: str = field(default_factory=lambda: os.getenv("MODEL_NAME", "gemini-2.5-flash"))
+    groq_model_name: str = field(default_factory=lambda: os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile"))
     temperature: float = field(default_factory=lambda: _get_float("TEMPERATURE", 0.9))
 
     # Memória
