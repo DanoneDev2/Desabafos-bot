@@ -337,25 +337,35 @@ class ProvedorDeIA:
     # Implementações específicas de cada provedor
     # ------------------------------------------------------------------
 
-    async def _gerar_com_gemini(self, historico: list[dict[str, str]], nova_mensagem: str) -> str:
-        """Gera resposta usando a API do Google Gemini."""
+    async def _gerar_com_gemini(
+    self,
+    historico: list[dict[str, str]],
+    nova_mensagem: str,
+) -> str:
 
-        def _chamada_sincrona() -> str:
-            historico_gemini = [
-                {
-                    "role": "user" if msg["role"] == "user" else "model",
-                    "parts": [msg["content"]],
-                }
-                for msg in historico
-            ]
+    def _chamada():
 
-            chat = self._modelo_gemini.start_chat(history=historico_gemini)
-            resposta = chat.send_message(
-                nova_mensagem,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=self._config.temperature,
-                ),
-            )
+        conversa = ""
+
+        for msg in historico:
+            if msg["role"] == "user":
+                conversa += f"Usuário: {msg['content']}\n"
+            else:
+                conversa += f"Assistente: {msg['content']}\n"
+
+        conversa += f"Usuário: {nova_mensagem}"
+
+        resposta = self._cliente_gemini.models.generate_content(
+            model=self._config.model_name,
+            contents=conversa,
+            config={
+                "temperature": self._config.temperature,
+                "system_instruction": SYSTEM_PROMPT,
+            },
+        )
+        return resposta.text.strip()
+
+    return await asyncio.to_thread(_chamada)
             return resposta.text.strip()
 
         return await asyncio.to_thread(_chamada_sincrona)
