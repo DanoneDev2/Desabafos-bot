@@ -12,15 +12,17 @@ disparada com `asyncio.ensure_future` a partir de `on_ready`.
 from __future__ import annotations
 
 import asyncio
-import time
+from datetime import datetime, timezone
 
 import discord
 
 import logger as log
+import ui
 from ai import ProvedorDeIA
 from config import Config
 from database import Database
 from memory import GerenciadorDeMemoria
+from ticket_manager import GerenciadorDeTickets
 
 
 async def loop_backup(db: Database, config: Config) -> None:
@@ -87,18 +89,78 @@ async def loop_watchdog(
             log.erro("Erro dentro do próprio watchdog (ignorado, watchdog continua rodando)", exc)
 
 
+async def loop_fechamento_automatico(
+    client: discord.Client,
+    tickets: GerenciadorDeTickets,
+    ia: ProvedorDeIA,
+    config: Config,
+) -> None:
+    """
+    Verifica periodicamente os tickets abertos: envia um aviso de
+    inatividade após `AUTO_CLOSE_HOURS` sem mensagens e, se a sessão
+    continuar inativa por mais `AUTO_CLOSE_TOLERANCIA_HORAS`, encerra a
+    conversa automaticamente (gerando o resumo normalmente).
+    """
+    intervalo_segundos = max(60, config.ticket_check_intervalo_minutos * 60)
+    while True:
+        try:
+            sessoes = await tickets.sessoes_para_avaliar_fechamento()
+            agora = datetime.now(timezone.utc)
+
+            for sessao in sessoes:
+                if not sessao.last_activity:
+                    continue
+
+                canal = client.get_channel(sessao.channel_id)
+                if canal is None:
+                    continue  # canal já não existe mais (ex: apagado manualmente)
+
+                try:
+                    ultima_atividade = datetime.fromisoformat(sessao.last_activity)
+                except ValueError:
+                    continue
+
+                horas_inativa = (agora - ultima_atividade).total_seconds() / 3600
+
+                if not sessao.aviso_inatividade_enviado and horas_inativa >= config.auto_close_horas:
+                    try:
+                        await canal.send(
+                            "Faz um tempo que a gente não conversa por aqui. Posso encerrar esta "
+                            "conversa? Se preferir continuar, é só me responder. 💜",
+                            view=ui.AvisoInatividadeView(client),
+                        )
+                        await tickets.marcar_aviso_inatividade(sessao.id)
+                    except Exception as exc:  # noqa: BLE001
+                        log.erro(f"Falha ao enviar aviso de inatividade da sessão #{sessao.id}", exc)
+
+                elif sessao.aviso_inatividade_enviado and horas_inativa >= (
+                    config.auto_close_horas + config.auto_close_tolerancia_horas
+                ):
+                    try:
+                        await tickets.encerrar_definitivamente(sessao, canal, ia, config)
+                    except Exception as exc:  # noqa: BLE001
+                        log.erro(f"Falha ao encerrar automaticamente a sessão #{sessao.id}", exc)
+
+        except Exception as exc:  # noqa: BLE001 - o loop nunca pode morrer
+            log.erro("Falha no loop de fechamento automático de tickets", exc)
+
+        await asyncio.sleep(intervalo_segundos)
+
+
 def iniciar_tarefas_em_background(
     client: discord.Client,
     db: Database,
     memoria: GerenciadorDeMemoria,
     ia: ProvedorDeIA,
     config: Config,
+    tickets: GerenciadorDeTickets,
 ) -> list[asyncio.Task]:
     """Dispara todas as tarefas periódicas e retorna as referências das tasks."""
     tarefas = [
         asyncio.ensure_future(loop_backup(db, config)),
         asyncio.ensure_future(loop_limpeza(memoria, config)),
         asyncio.ensure_future(loop_watchdog(client, db, ia, config)),
+        asyncio.ensure_future(loop_fechamento_automatico(client, tickets, ia, config)),
     ]
-    log.info("Tarefas em background iniciadas: backup, limpeza e watchdog.")
+    log.info("Tarefas em background iniciadas: backup, limpeza, watchdog e fechamento automático de tickets.")
     return tarefas

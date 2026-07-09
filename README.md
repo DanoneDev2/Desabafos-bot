@@ -45,6 +45,55 @@ gratuitos, inclusive no Termux.
 
 ---
 
+## Novidades da v3.0 — Sessões privadas (Tickets)
+
+A maior mudança da v3.0: o bot deixou de ser um canal único onde todos
+conversam e passou a ser um sistema de **tickets/sessões privadas**,
+como um atendimento individual:
+
+- **Painel permanente**: uma embed fixa com o botão 💜 **Iniciar
+  Conversa**, publicada automaticamente no canal configurado em
+  `CANAL_DESABAFOS` (que agora representa "canal do painel", não mais
+  o canal de conversa).
+- **Canal privado por pessoa** (`🌙・nome-do-usuário`), visível apenas
+  para quem abriu o ticket, o bot e a equipe de apoio (`STAFF_ROLE_ID`).
+  Só é permitida **uma conversa ativa por usuário** por vez.
+- **Encerramento com confirmação**: botão 🔒 **Encerrar Conversa**, que
+  pede confirmação, gera um **resumo estruturado** (principais
+  assuntos, preocupações, objetivos e emoção predominante) via IA e
+  então apaga o canal.
+- **Fechamento automático por inatividade**: após `AUTO_CLOSE_HOURS`
+  sem mensagens, o bot pergunta se pode encerrar; se continuar
+  inativo por mais `AUTO_CLOSE_TOLERANCIA_HORAS`, encerra sozinho.
+- **Continuidade entre conversas**: ao abrir uma nova sessão, a IA
+  recebe o resumo da conversa anterior em vez de nenhum contexto,
+  então a pessoa não precisa "começar do zero".
+- **Classificação leve de emoção** (`emotion.py`) por mensagem
+  (feliz/neutro/triste/ansioso/raiva/medo/desesperança) — uma
+  heurística interna para organizar as sessões, não um diagnóstico.
+- **Detecção de crise isolada** (`crisis.py`): quando há indícios
+  graves de risco à vida, o bot interrompe o fluxo normal e responde
+  com uma mensagem de segurança fixa (CVV 188 e emergência), sempre,
+  independente da IA.
+- **Indicador "💭 Pensando..."**: o bot envia essa mensagem e a edita
+  com a resposta final, em vez de enviar uma mensagem nova.
+- **`/health` e `/version` expandidos**: agora mostram também tickets
+  ativos/encerrados, fallbacks, crises detectadas, uso de memória,
+  status do circuit breaker e da fila, arquitetura e quantidade de
+  módulos.
+- **Migração do SDK do Gemini**: de `google-generativeai` para o novo
+  SDK unificado `google-genai`, conforme exigido pela v3.0.
+- **`streaming.py`**: interfaces desacopladas preparadas para uma
+  futura resposta em streaming (ainda não ativado — `ENABLE_STREAMING`
+  fica reservado para isso).
+
+Nada do que já existia foi removido: memória, fila, retry, circuit
+breaker, backup automático, watchdog, logger e configuração
+centralizada continuam funcionando exatamente como antes, agora
+aplicados por sessão em vez de por canal fixo.
+
+---
+
 ## Índice
 
 1. [Estrutura do projeto](#estrutura-do-projeto)
@@ -70,9 +119,15 @@ desabafos-bot/
 ├── config.py          # Carrega e valida configurações do .env
 ├── ai.py              # IA (Gemini + fallback Groq, fila, retry, circuit breaker)
 ├── prompts.py          # Prompt de sistema / personalidade da IA
-├── memory.py           # Histórico de conversa isolado por usuário + resumo automático
-├── database.py         # SQLite: blacklist, estatísticas, config persistente, backup
-├── scheduler.py         # Tarefas periódicas: backup, limpeza e watchdog
+├── memory.py           # Histórico de conversa isolado por sessão + resumo automático
+├── database.py         # SQLite: sessions, messages, blacklist, config, backup
+├── ticket_manager.py    # Ciclo de vida das sessões privadas (tickets)
+├── ui.py               # Painel e botões (Iniciar/Encerrar Conversa)
+├── crisis.py            # Detecção determinística de risco à vida
+├── emotion.py            # Classificação leve de emoção por mensagem
+├── summarizer.py         # Resumo estruturado gerado ao encerrar uma sessão
+├── streaming.py          # Interfaces desacopladas p/ streaming futuro
+├── scheduler.py         # Tarefas periódicas: backup, limpeza, watchdog, auto-close
 ├── version.py           # Versão e data de build (usados no /version)
 ├── events.py           # Eventos do Discord + comandos /health e /version
 ├── logger.py           # Sistema de logs coloridos (terminal + arquivo)
@@ -294,6 +349,9 @@ adicionadas, e você precisará copiá-las para o seu `.env` existente.
 | `/health` mostra um provedor como "indisponível" | Circuit breaker aberto após falhas consecutivas | Aguarde o tempo configurado em `CIRCUIT_BREAKER_TIMEOUT_SEGUNDOS`; o provedor volta a ser tentado automaticamente |
 | Banco de dados não abre / erro de permissão em `dados/` | Pasta sem permissão de escrita | Garanta que o processo tem permissão de escrita na pasta do projeto (o SQLite e os backups ficam em `dados/`) |
 | Mensagens de um usuário sendo ignoradas sem motivo aparente | Usuário pode estar na blacklist persistida no SQLite | Verifique a tabela `blacklist` no banco (`dados/desabafos.db`) |
+| Botão "Iniciar Conversa" não cria o canal | `CATEGORY_TICKETS` ausente/incorreto e `ENABLE_PRIVATE_THREADS=false` | Defina `CATEGORY_TICKETS` com o ID de uma categoria válida, ou ative `ENABLE_PRIVATE_THREADS=true` |
+| Painel não aparece / aparece duplicado | Mensagem do painel foi apagada manualmente, ou o bot não tem permissão no canal | O bot detecta e republica automaticamente se a mensagem salva não existir mais; confira as permissões do canal |
+| "Você já possui uma conversa ativa" mesmo sem canal visível | O canal do ticket foi apagado manualmente, sem passar pelo botão de encerrar | Encerre a sessão pendente diretamente no banco (`sessions`, coluna `status`) ou aguarde o fechamento automático |
 
 ---
 

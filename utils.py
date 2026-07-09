@@ -125,3 +125,26 @@ def eh_erro_contexto_muito_grande(exc: Exception) -> bool:
     mensagem = str(exc).lower()
     termos = ("context length", "too many tokens", "context_length", "token limit", "maximum context")
     return any(termo in mensagem for termo in termos)
+
+
+def uso_memoria_mb() -> float:
+    """
+    Retorna o uso aproximado de memória RAM do processo atual, em MB.
+    Usa apenas a biblioteca padrão (sem dependências extras como psutil),
+    o que mantém o bot leve o suficiente para rodar em dispositivos
+    modestos e no Termux.
+    """
+    try:
+        import resource
+
+        uso_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # No Linux, ru_maxrss vem em KB; no macOS, vem em bytes.
+        import sys
+
+        if sys.platform == "darwin":
+            return uso_kb / (1024 * 1024)
+        return uso_kb / 1024
+    except ImportError:
+        # "resource" não existe no Windows; sem dependência extra, não há
+        # como medir com precisão — retorna 0.0 nesse caso.
+        return 0.0

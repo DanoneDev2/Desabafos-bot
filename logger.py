@@ -143,3 +143,28 @@ def backup(mensagem: str) -> None:
 
 def limpeza(mensagem: str) -> None:
     log.info(f"[limpeza] {mensagem}")
+
+
+def ticket_criado(session_id: int, usuario: str, canal: str) -> None:
+    log.info(f"[ticket] Sessão #{session_id} criada para {usuario} em '{canal}'.")
+
+
+def ticket_fechado(session_id: int, duracao_legivel: str = "", quantidade_mensagens: int | None = None) -> None:
+    detalhes = ""
+    if duracao_legivel:
+        detalhes += f" | duração: {duracao_legivel}"
+    if quantidade_mensagens is not None:
+        detalhes += f" | mensagens: {quantidade_mensagens}"
+    log.info(f"[ticket] Sessão #{session_id} fechada{detalhes}.")
+
+
+def sessao_reaberta(session_id: int) -> None:
+    log.info(f"[ticket] Sessão #{session_id} reaberta (fechamento cancelado).")
+
+
+def resumo_criado(session_id: int, modelo: str) -> None:
+    log.info(f"[ticket] Resumo da sessão #{session_id} criado (modelo: {modelo}).")
+
+
+def crise_detectada(session_id: int) -> None:
+    log.warning(f"[crise] Indícios de crise detectados na sessão #{session_id}.")
