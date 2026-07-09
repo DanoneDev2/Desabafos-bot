@@ -215,10 +215,10 @@ TOKEN_DISCORD=seu_token_aqui
 CANAL_DESABAFOS=123456789012345678
 
 API_KEY_GEMINI=sua_chave_gemini
-MODEL_NAME=gemini-1.5-flash
+MODEL_NAME=gemini-2.5-flash
 
 API_KEY_GROQ=sua_chave_groq
-GROQ_MODEL_NAME=llama-3.1-70b-versatile
+GROQ_MODEL_NAME=llama-3.3-70b-versatile
 
 TEMPERATURE=0.9
 MAX_HISTORY=10
