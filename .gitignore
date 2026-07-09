@@ -1,61 +1,26 @@
-# ==========================
 # Ambiente
-# ==========================
 .env
-.env.local
 venv/
 .venv/
 env/
 
-# ==========================
 # Python
-# ==========================
 __pycache__/
 *.py[cod]
 *$py.class
 *.egg-info/
 .eggs/
-build/
-dist/
 
-# ==========================
 # Logs
-# ==========================
 *.log
-logs/
-dados/logs/
 
-# ==========================
-# Banco de dados SQLite
-# ==========================
-*.db
-*.sqlite
-*.sqlite3
-dados/*.db
-
-# ==========================
-# Backups
-# ==========================
-dados/backups/
-
-# ==========================
-# Sistema Operacional
-# ==========================
+# Sistema operacional
 .DS_Store
 Thumbs.db
 
-# ==========================
 # Editores
-# ==========================
 .vscode/
 .idea/
 
-# ==========================
-# Termux / Android
-# ==========================
+# Termux / Android específico
 .termux-session
-
-# ==========================
-# Manter a pasta dados
-# ==========================
-!dados/.gitkeep
