@@ -38,6 +38,14 @@ def _get_float(env_name: str, default: float) -> float:
         return default
 
 
+def _get_bool(env_name: str, default: bool) -> bool:
+    """Lê uma variável de ambiente como booleano ('true'/'1'/'sim' contam como verdadeiro)."""
+    raw = os.getenv(env_name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "sim", "yes", "on")
+
+
 @dataclass(frozen=True)
 class Config:
     """Configuração imutável do bot, montada a partir do ambiente."""
@@ -46,11 +54,31 @@ class Config:
     token_discord: str = field(default_factory=lambda: os.getenv("TOKEN_DISCORD", ""))
     canal_desabafos: int = field(default_factory=lambda: _get_int("CANAL_DESABAFOS", 0))
 
+    # Sistema de Tickets / Sessões privadas (v3.0)
+    # ATENÇÃO: a partir da v3.0, CANAL_DESABAFOS deixa de ser o canal onde
+    # todos conversam e passa a ser o canal onde o PAINEL ("Iniciar
+    # Conversa") é publicado. Isso preserva compatibilidade com quem já
+    # tinha essa variável configurada.
+    staff_role_id: int = field(default_factory=lambda: _get_int("STAFF_ROLE_ID", 0))
+    category_tickets: int = field(default_factory=lambda: _get_int("CATEGORY_TICKETS", 0))
+    auto_close_horas: float = field(default_factory=lambda: _get_float("AUTO_CLOSE_HOURS", 48.0))
+    auto_close_tolerancia_horas: float = field(
+        default_factory=lambda: _get_float("AUTO_CLOSE_TOLERANCIA_HORAS", 6.0)
+    )
+    ticket_check_intervalo_minutos: int = field(
+        default_factory=lambda: _get_int("TICKET_CHECK_INTERVALO_MINUTOS", 30)
+    )
+    summary_model: str = field(default_factory=lambda: os.getenv("SUMMARY_MODEL", ""))
+    session_limit: int = field(default_factory=lambda: _get_int("SESSION_LIMIT", 0))
+    enable_crisis_mode: bool = field(default_factory=lambda: _get_bool("ENABLE_CRISIS_MODE", True))
+    enable_streaming: bool = field(default_factory=lambda: _get_bool("ENABLE_STREAMING", False))
+    enable_private_threads: bool = field(default_factory=lambda: _get_bool("ENABLE_PRIVATE_THREADS", False))
+
     # IA
     api_key_gemini: str = field(default_factory=lambda: os.getenv("API_KEY_GEMINI", os.getenv("API_KEY_IA", "")))
     api_key_groq: str = field(default_factory=lambda: os.getenv("API_KEY_GROQ", ""))
-    model_name: str = field(default_factory=lambda: os.getenv("MODEL_NAME", "gemini-2.5-flash"))
-    groq_model_name: str = field(default_factory=lambda: os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile"))
+    model_name: str = field(default_factory=lambda: os.getenv("MODEL_NAME", "gemini-1.5-flash"))
+    groq_model_name: str = field(default_factory=lambda: os.getenv("GROQ_MODEL_NAME", "llama-3.1-70b-versatile"))
     temperature: float = field(default_factory=lambda: _get_float("TEMPERATURE", 0.9))
 
     # Memória
@@ -119,6 +147,15 @@ class Config:
         if self.circuit_breaker_falhas_consecutivas < 1:
             problemas.append("CIRCUIT_BREAKER_FALHAS_CONSECUTIVAS deve ser maior ou igual a 1")
 
+        if not self.enable_private_threads and not self.category_tickets:
+            problemas.append(
+                "CATEGORY_TICKETS não foi definido (obrigatório para criar canais de ticket; "
+                "defina ENABLE_PRIVATE_THREADS=true para usar threads privadas em vez de categoria)"
+            )
+
+        if self.auto_close_horas <= 0:
+            problemas.append("AUTO_CLOSE_HOURS deve ser maior que 0")
+
         return problemas
 
     def contexto_efetivo(self) -> int:
@@ -129,6 +166,16 @@ class Config:
         if self.contexto_maximo_envio and self.contexto_maximo_envio > 0:
             return min(self.contexto_maximo_envio, self.max_history)
         return self.max_history
+
+    @property
+    def canal_painel(self) -> int:
+        """Canal onde o painel permanente ('Iniciar Conversa') é publicado."""
+        return self.canal_desabafos
+
+    @property
+    def modelo_resumo(self) -> str:
+        """Modelo Gemini usado para gerar resumos de sessão (SUMMARY_MODEL ou, por padrão, MODEL_NAME)."""
+        return self.summary_model or self.model_name
 
 
 config = Config()
