@@ -132,6 +132,15 @@ class GerenciadorDeMemoria:
         """Remove todo o histórico de um usuário específico."""
         self._estados.pop(usuario_id, None)
 
+    def definir_resumo_inicial(self, usuario_id: int, resumo: str) -> None:
+        """
+        Semeia um resumo inicial para uma chave (ex: uma nova sessão de
+        ticket), dando continuidade a partir de uma conversa anterior já
+        encerrada, sem precisar reenviar centenas de mensagens antigas à IA.
+        """
+        estado = self._estados.setdefault(usuario_id, _EstadoUsuario(mensagens=deque()))
+        estado.resumo = resumo.strip()
+
     def total_usuarios_ativos(self) -> int:
         """Retorna quantos usuários possuem histórico ativo em memória."""
         return len(self._estados)

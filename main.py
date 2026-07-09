@@ -29,23 +29,8 @@ def main() -> None:
     log.configurar_arquivo("dados/logs/bot.log", config.logs_retencao_dias)
     log.info("Iniciando Bot de Desabafos...")
 
-    db = Database(
-        caminho_db=config.db_path,
-        pasta_backup=config.db_backup_dir,
-    )
-
+    db = Database(caminho_db=config.db_path, pasta_backup=config.db_backup_dir)
     bot = BotDeDesabafos(config, db)
-
-    # ===== Logs de diagnóstico =====
-    log.info(f"discord.py: {discord.__version__}")
-    log.info(f"Canal de desabafos: {config.canal_desabafos}")
-    log.info(f"Token começa com: {config.token_discord[:15]}...")
-
-    intents = discord.Intents.default()
-    intents.message_content = True
-
-    log.info(f"Message Content Intent: {intents.message_content}")
-    # ===============================
 
     try:
         bot.run(config.token_discord, log_handler=None)

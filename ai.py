@@ -5,7 +5,7 @@ Isola toda a lógica de comunicação com provedores de IA. Nenhuma
 lógica relacionada ao Discord deve existir neste módulo.
 
 Prioridade de provedores:
-    1. Google Gemini
+    1. Google Gemini (via SDK unificado `google-genai`)
     2. Groq (fallback automático em caso de falha/indisponibilidade)
 
 ATUALIZAÇÃO — a interface pública (gerar_resposta) permanece a mesma,
@@ -20,19 +20,23 @@ mas agora, internamente:
       marcando-o temporariamente indisponível e usando o secundário,
       com reativação automática após um tempo configurável;
     - erros de "contexto muito grande" acionam redução automática do
-      histórico enviado (via memory.py) e uma nova tentativa.
+      histórico enviado (via memory.py) e uma nova tentativa;
+    - é possível solicitar um modelo Gemini diferente do padrão para uma
+      chamada específica (usado por `summarizer.py` via `SUMMARY_MODEL`),
+      sem mudar a assinatura pública de `gerar_resposta` para quem não
+      precisa disso.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
 from google import genai
+from google.genai import types as genai_types
 from groq import Groq
-from google.genai import types
 
 import logger as log
 from config import Config
@@ -104,6 +108,7 @@ class _RequisicaoIA:
     nova_mensagem: str
     usuario_id: Optional[int]
     future: "asyncio.Future[str]"
+    modelo: Optional[str] = None
 
 
 class ProvedorDeIA:
@@ -126,13 +131,7 @@ class ProvedorDeIA:
         self._gemini_disponivel = bool(config.api_key_gemini)
         self._groq_disponivel = bool(config.api_key_groq)
 
-        if self._gemini_disponivel:
-            self._cliente_gemini = genai.Client(
-                api_key=config.api_key_gemini
-             )
-        else:
-            self._cliente_gemini = None
-
+        self._cliente_gemini = genai.Client(api_key=config.api_key_gemini) if self._gemini_disponivel else None
         self._cliente_groq = Groq(api_key=config.api_key_groq) if self._groq_disponivel else None
 
         self._circuit_breaker = _CircuitBreaker(
@@ -154,6 +153,7 @@ class ProvedorDeIA:
         historico: list[dict[str, str]],
         nova_mensagem: str,
         usuario_id: int | None = None,
+        modelo: str | None = None,
     ) -> str:
         """
         Gera uma resposta de IA. A chamada é colocada em uma fila
@@ -165,6 +165,10 @@ class ProvedorDeIA:
             nova_mensagem: mensagem atual enviada pelo usuário.
             usuario_id: identificador do usuário (opcional), usado para
                 redução automática de contexto em caso de erro.
+            modelo: nome de um modelo Gemini específico para esta chamada
+                (opcional). Usado por `summarizer.py` para permitir um
+                modelo diferente (`SUMMARY_MODEL`) na geração de resumos,
+                sem afetar as conversas normais.
 
         Returns:
             Texto de resposta gerado pela IA.
@@ -180,6 +184,7 @@ class ProvedorDeIA:
             nova_mensagem=nova_mensagem,
             usuario_id=usuario_id,
             future=future,
+            modelo=modelo,
         )
 
         try:
@@ -198,6 +203,10 @@ class ProvedorDeIA:
             status["groq"] = self._circuit_breaker.status("groq")
         return status
 
+    def tamanho_fila(self) -> int:
+        """Retorna quantas requisições estão aguardando na fila assíncrona (para o /health)."""
+        return self._fila.qsize()
+
     # ------------------------------------------------------------------
     # Fila assíncrona (worker)
     # ------------------------------------------------------------------
@@ -205,7 +214,7 @@ class ProvedorDeIA:
     def _garantir_worker_ativo(self) -> None:
         """Inicia o worker da fila na primeira chamada (requer loop em execução)."""
         if not self._worker_iniciado:
-            asyncio.create_task(self._worker_loop())
+            asyncio.ensure_future(self._worker_loop())
             self._worker_iniciado = True
 
     async def _worker_loop(self) -> None:
@@ -214,7 +223,7 @@ class ProvedorDeIA:
             requisicao = await self._fila.get()
             try:
                 resposta = await self._gerar_com_fallback(
-                    requisicao.historico, requisicao.nova_mensagem, requisicao.usuario_id
+                    requisicao.historico, requisicao.nova_mensagem, requisicao.usuario_id, requisicao.modelo
                 )
                 if not requisicao.future.done():
                     requisicao.future.set_result(resposta)
@@ -229,7 +238,11 @@ class ProvedorDeIA:
     # ------------------------------------------------------------------
 
     async def _gerar_com_fallback(
-        self, historico: list[dict[str, str]], nova_mensagem: str, usuario_id: int | None
+        self,
+        historico: list[dict[str, str]],
+        nova_mensagem: str,
+        usuario_id: int | None,
+        modelo: str | None = None,
     ) -> str:
         erros: list[str] = []
         motivo_fallback = ""
@@ -238,8 +251,9 @@ class ProvedorDeIA:
             if self._circuit_breaker.disponivel("gemini"):
                 inicio = time.monotonic()
                 try:
+                    funcao_gemini = lambda h, m: self._gerar_com_gemini(h, m, modelo)  # noqa: E731
                     resposta = await self._gerar_com_retry(
-                        "gemini", self._gerar_com_gemini, historico, nova_mensagem, usuario_id
+                        "gemini", funcao_gemini, historico, nova_mensagem, usuario_id
                     )
                     self._circuit_breaker.registrar_sucesso("gemini")
                     await self._registrar("respostas_gemini")
@@ -335,41 +349,37 @@ class ProvedorDeIA:
             await self._registrar_estatistica(chave)
 
     # ------------------------------------------------------------------
-        # ------------------------------------------------------------------
     # Implementações específicas de cada provedor
     # ------------------------------------------------------------------
 
     async def _gerar_com_gemini(
-        self,
-        historico: list[dict[str, str]],
-        nova_mensagem: str,
+        self, historico: list[dict[str, str]], nova_mensagem: str, modelo: str | None = None
     ) -> str:
-        """Gera resposta usando o novo SDK google-genai."""
+        """Gera resposta usando a API do Google Gemini (SDK `google-genai`)."""
+        modelo_usado = modelo or self._config.model_name
 
-        def _chamada() -> str:
-            conversa = ""
-
-            for msg in historico:
-                if msg["role"] == "user":
-                    conversa += f"Usuário: {msg['content']}\n"
-                else:
-                    conversa += f"Assistente: {msg['content']}\n"
-
-            conversa += f"Usuário: {nova_mensagem}"
-
-            resposta = self._cliente_gemini.models.generate_content(
-                model=self._config.model_name,
-                contents=conversa,
-                config=types.GenerateContentConfig(
-                   system_instruction=SYSTEM_PROMPT,
-                   temperature=self._config.temperature,
+        def _chamada_sincrona() -> str:
+            historico_gemini = [
+                genai_types.Content(
+                    role="user" if msg["role"] == "user" else "model",
+                    parts=[genai_types.Part(text=msg["content"])],
                 )
+                for msg in historico
+            ]
+
+            chat = self._cliente_gemini.chats.create(
+                model=modelo_usado,
+                history=historico_gemini,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    temperature=self._config.temperature,
+                ),
             )
+            resposta = chat.send_message(nova_mensagem)
+            return resposta.text.strip()
 
-            return (resposta.text or "").strip()
+        return await asyncio.to_thread(_chamada_sincrona)
 
-        return await asyncio.to_thread(_chamada)
-        
     async def _gerar_com_groq(self, historico: list[dict[str, str]], nova_mensagem: str) -> str:
         """Gera resposta usando a API da Groq, como fallback."""
 

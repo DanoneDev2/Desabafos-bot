@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 
 import logger as log
 
-VERSAO_SCHEMA_ATUAL = 1
+VERSAO_SCHEMA_ATUAL = 2
 
 # Definição das tabelas geridas pela migração automática.
 _TABELAS: dict[str, str] = {
@@ -64,7 +64,61 @@ _TABELAS: dict[str, str] = {
             ultima_vez TEXT NOT NULL
         )
     """,
+    # --- Sistema de Tickets / Sessões privadas (v3.0) ---------------------
+    "sessions": """
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            opened_at TEXT NOT NULL,
+            closed_at TEXT,
+            status TEXT NOT NULL DEFAULT 'aberta',
+            summary TEXT,
+            main_topics TEXT,
+            concerns TEXT,
+            goals TEXT,
+            emotion TEXT,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            last_activity TEXT NOT NULL,
+            aviso_inatividade_enviado INTEGER NOT NULL DEFAULT 0,
+            crise_detectada INTEGER NOT NULL DEFAULT 0
+        )
+    """,
+    "messages": """
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            emotion TEXT,
+            created_at TEXT NOT NULL
+        )
+    """,
 }
+
+# Colunas esperadas por tabela — usado pela migração para ADICIONAR
+# colunas que ainda não existem em bancos criados por versões antigas,
+# sem nunca recriar ou apagar a tabela.
+_COLUNAS_ESPERADAS: dict[str, dict[str, str]] = {
+    "sessions": {
+        "summary": "TEXT",
+        "main_topics": "TEXT",
+        "concerns": "TEXT",
+        "goals": "TEXT",
+        "emotion": "TEXT",
+        "aviso_inatividade_enviado": "INTEGER NOT NULL DEFAULT 0",
+        "crise_detectada": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "messages": {
+        "emotion": "TEXT",
+    },
+}
+
+_INDICES: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_sessions_user_status ON sessions(user_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_channel ON sessions(channel_id)",
+    "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)",
+)
 
 
 class Database:
@@ -102,8 +156,10 @@ class Database:
 
     def _migrar_sync(self) -> None:
         """
-        Cria apenas as tabelas ausentes (via CREATE TABLE IF NOT EXISTS).
-        Nunca recria o banco inteiro nem apaga dados existentes.
+        Cria apenas as tabelas ausentes (via CREATE TABLE IF NOT EXISTS) e
+        adiciona apenas as colunas ausentes em tabelas já existentes (via
+        PRAGMA table_info + ALTER TABLE ADD COLUMN). Nunca recria o banco
+        inteiro nem apaga dados existentes.
         """
         assert self._conexao is not None
         cursor = self._conexao.cursor()
@@ -111,8 +167,20 @@ class Database:
         for sql_criacao in _TABELAS.values():
             cursor.execute(sql_criacao)
 
+        for tabela, colunas in _COLUNAS_ESPERADAS.items():
+            colunas_existentes = {
+                row["name"] for row in cursor.execute(f"PRAGMA table_info({tabela})").fetchall()
+            }
+            for coluna, definicao_sql in colunas.items():
+                if coluna not in colunas_existentes:
+                    cursor.execute(f"ALTER TABLE {tabela} ADD COLUMN {coluna} {definicao_sql}")
+                    log.info(f"Migração: coluna '{coluna}' adicionada à tabela '{tabela}'.")
+
+        for sql_indice in _INDICES:
+            cursor.execute(sql_indice)
+
         cursor.execute(
-            "INSERT OR IGNORE INTO schema_meta (chave, valor) VALUES ('versao_schema', ?)",
+            "INSERT OR REPLACE INTO schema_meta (chave, valor) VALUES ('versao_schema', ?)",
             (str(VERSAO_SCHEMA_ATUAL),),
         )
         self._conexao.commit()
@@ -294,6 +362,210 @@ class Database:
         return destino
 
     # ------------------------------------------------------------------
+    # Sistema de Tickets / Sessões privadas (v3.0)
+    # ------------------------------------------------------------------
+
+    async def criar_sessao(self, user_id: int, channel_id: int) -> int:
+        """Cria uma nova sessão (ticket) 'aberta' e retorna seu id."""
+        agora = _agora_iso()
+
+        def _sync() -> int:
+            assert self._conexao is not None
+            cursor = self._conexao.execute(
+                """
+                INSERT INTO sessions (user_id, channel_id, opened_at, status, last_activity)
+                VALUES (?, ?, ?, 'aberta', ?)
+                """,
+                (user_id, channel_id, agora, agora),
+            )
+            self._conexao.commit()
+            return int(cursor.lastrowid)
+
+        return await asyncio.to_thread(_sync)
+
+    async def obter_sessao_ativa_por_usuario(self, user_id: int) -> dict | None:
+        """Retorna a sessão 'aberta' de um usuário, se existir."""
+
+        def _sync() -> dict | None:
+            assert self._conexao is not None
+            row = self._conexao.execute(
+                "SELECT * FROM sessions WHERE user_id = ? AND status = 'aberta' ORDER BY id DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+        return await asyncio.to_thread(_sync)
+
+    async def obter_ultima_sessao_fechada(self, user_id: int) -> dict | None:
+        """Retorna a sessão 'fechada' mais recente de um usuário (usada para dar continuidade)."""
+
+        def _sync() -> dict | None:
+            assert self._conexao is not None
+            row = self._conexao.execute(
+                "SELECT * FROM sessions WHERE user_id = ? AND status = 'fechada' ORDER BY closed_at DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+        return await asyncio.to_thread(_sync)
+
+    async def obter_sessao_por_canal(self, channel_id: int) -> dict | None:
+        """Retorna a sessão associada a um canal/thread, se existir (aberta ou não)."""
+
+        def _sync() -> dict | None:
+            assert self._conexao is not None
+            row = self._conexao.execute(
+                "SELECT * FROM sessions WHERE channel_id = ? ORDER BY id DESC LIMIT 1",
+                (channel_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+        return await asyncio.to_thread(_sync)
+
+    async def obter_sessao(self, session_id: int) -> dict | None:
+        """Retorna uma sessão pelo seu id."""
+
+        def _sync() -> dict | None:
+            assert self._conexao is not None
+            row = self._conexao.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            return dict(row) if row else None
+
+        return await asyncio.to_thread(_sync)
+
+    async def contar_sessoes_abertas(self) -> int:
+        """Conta quantas sessões estão com status 'aberta' (usado para SESSION_LIMIT e /health)."""
+
+        def _sync() -> int:
+            assert self._conexao is not None
+            row = self._conexao.execute("SELECT COUNT(*) AS total FROM sessions WHERE status = 'aberta'").fetchone()
+            return int(row["total"])
+
+        return await asyncio.to_thread(_sync)
+
+    async def contar_sessoes_fechadas(self) -> int:
+        """Conta quantas sessões já foram encerradas (usado no /health)."""
+
+        def _sync() -> int:
+            assert self._conexao is not None
+            row = self._conexao.execute("SELECT COUNT(*) AS total FROM sessions WHERE status = 'fechada'").fetchone()
+            return int(row["total"])
+
+        return await asyncio.to_thread(_sync)
+
+    async def registrar_mensagem_sessao(
+        self, session_id: int, role: str, content: str, emotion: str | None = None
+    ) -> None:
+        """Salva uma mensagem da sessão, incrementa o contador e atualiza a última atividade."""
+        agora = _agora_iso()
+
+        def _sync() -> None:
+            assert self._conexao is not None
+            self._conexao.execute(
+                "INSERT INTO messages (session_id, role, content, emotion, created_at) VALUES (?, ?, ?, ?, ?)",
+                (session_id, role, content, emotion, agora),
+            )
+            self._conexao.execute(
+                """
+                UPDATE sessions
+                SET message_count = message_count + 1, last_activity = ?, aviso_inatividade_enviado = 0
+                WHERE id = ?
+                """,
+                (agora, session_id),
+            )
+            if emotion:
+                self._conexao.execute("UPDATE sessions SET emotion = ? WHERE id = ?", (emotion, session_id))
+            self._conexao.commit()
+
+        await asyncio.to_thread(_sync)
+
+    async def obter_mensagens_sessao(self, session_id: int) -> list[dict]:
+        """Retorna todas as mensagens de uma sessão, em ordem cronológica."""
+
+        def _sync() -> list[dict]:
+            assert self._conexao is not None
+            rows = self._conexao.execute(
+                "SELECT role, content, emotion, created_at FROM messages WHERE session_id = ? ORDER BY id ASC",
+                (session_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+        return await asyncio.to_thread(_sync)
+
+    async def fechar_sessao(
+        self,
+        session_id: int,
+        summary: str = "",
+        main_topics: str = "",
+        concerns: str = "",
+        goals: str = "",
+        emotion: str = "",
+    ) -> None:
+        """Marca uma sessão como 'fechada' e salva o resumo gerado ao encerrar."""
+        agora = _agora_iso()
+
+        def _sync() -> None:
+            assert self._conexao is not None
+            self._conexao.execute(
+                """
+                UPDATE sessions
+                SET status = 'fechada', closed_at = ?, summary = ?, main_topics = ?, concerns = ?, goals = ?,
+                    emotion = COALESCE(NULLIF(?, ''), emotion)
+                WHERE id = ?
+                """,
+                (agora, summary, main_topics, concerns, goals, emotion, session_id),
+            )
+            self._conexao.commit()
+
+        await asyncio.to_thread(_sync)
+
+    async def reabrir_sessao(self, session_id: int) -> None:
+        """Cancela um fechamento pendente: mantém a sessão 'aberta' e reseta o aviso de inatividade."""
+        agora = _agora_iso()
+
+        def _sync() -> None:
+            assert self._conexao is not None
+            self._conexao.execute(
+                "UPDATE sessions SET status = 'aberta', last_activity = ?, aviso_inatividade_enviado = 0 WHERE id = ?",
+                (agora, session_id),
+            )
+            self._conexao.commit()
+
+        await asyncio.to_thread(_sync)
+
+    async def marcar_aviso_inatividade_enviado(self, session_id: int) -> None:
+        """Marca que o aviso de 'posso encerrar?' já foi enviado, evitando repetição."""
+
+        def _sync() -> None:
+            assert self._conexao is not None
+            self._conexao.execute(
+                "UPDATE sessions SET aviso_inatividade_enviado = 1 WHERE id = ?", (session_id,)
+            )
+            self._conexao.commit()
+
+        await asyncio.to_thread(_sync)
+
+    async def marcar_crise(self, session_id: int) -> None:
+        """Marca que uma sessão teve um episódio de crise detectado."""
+
+        def _sync() -> None:
+            assert self._conexao is not None
+            self._conexao.execute("UPDATE sessions SET crise_detectada = 1 WHERE id = ?", (session_id,))
+            self._conexao.commit()
+
+        await asyncio.to_thread(_sync)
+        await self.incrementar_estatistica("crises_detectadas")
+
+    async def listar_sessoes_abertas_para_verificacao(self) -> list[dict]:
+        """Retorna todas as sessões abertas, para a rotina de fechamento automático avaliar inatividade."""
+
+        def _sync() -> list[dict]:
+            assert self._conexao is not None
+            rows = self._conexao.execute("SELECT * FROM sessions WHERE status = 'aberta'").fetchall()
+            return [dict(row) for row in rows]
+
+        return await asyncio.to_thread(_sync)
+
+    # ------------------------------------------------------------------
     # Verificação de saúde (usada pelo /health)
     # ------------------------------------------------------------------
 
@@ -310,6 +582,19 @@ class Database:
         except Exception as exc:  # noqa: BLE001
             log.erro("Falha na verificação de saúde do banco de dados", exc)
             return False
+
+    async def ultimo_backup_info(self) -> str | None:
+        """Retorna o nome do backup mais recente encontrado, ou None se não houver nenhum."""
+
+        def _sync() -> str | None:
+            if not os.path.isdir(self._pasta_backup):
+                return None
+            backups = sorted(
+                f for f in os.listdir(self._pasta_backup) if f.startswith("desabafos-") and f.endswith(".db")
+            )
+            return backups[-1] if backups else None
+
+        return await asyncio.to_thread(_sync)
 
 
 def _agora_iso() -> str:
