@@ -31,11 +31,13 @@ import logger as log
 import scheduler
 import ui
 import version
+from admin_panel import PainelAdminView, montar_embed_admin
 from ai import ErroDeIA, ProvedorDeIA
 from config import Config
 from database import Database
 from memory import GerenciadorDeMemoria
-from ticket_manager import GerenciadorDeTickets
+from prompts import PROMPT_COOPERACAO
+from ticket_manager import GerenciadorDeTickets, Sessao
 from utils import ControladorDeCooldown, mensagem_valida, uso_memoria_mb
 
 
@@ -60,7 +62,9 @@ class BotDeDesabafos(discord.Client):
         )
         self._tickets = GerenciadorDeTickets(db, config, memoria=self._memoria)
         self._cooldown = ControladorDeCooldown(segundos=config.cooldown_segundos)
-        self._ia = ProvedorDeIA(config, memoria=self._memoria, registrar_estatistica=self._registrar_estatistica)
+        self._ia = ProvedorDeIA(
+            config, memoria=self._memoria, registrar_estatistica=self._registrar_estatistica, db=self._db
+        )
 
         self._tentativas_reconexao = 0
         self._inicio_bot = time.monotonic()
@@ -74,6 +78,11 @@ class BotDeDesabafos(discord.Client):
     async def _registrar_estatistica(self, chave: str) -> None:
         """Callback repassado ao ProvedorDeIA para persistir estatísticas por provedor."""
         await self._db.incrementar_estatistica(chave)
+
+    @property
+    def db(self) -> Database:
+        """Acesso à camada de persistência, para módulos que gerenciam sua própria configuração (ex: admin_panel.py)."""
+        return self._db
 
     # ------------------------------------------------------------------
     # Ciclo de vida
@@ -92,6 +101,7 @@ class BotDeDesabafos(discord.Client):
         self.add_view(ui.TicketView(self))
         self.add_view(ui.ConfirmarEncerramentoView(self))
         self.add_view(ui.AvisoInatividadeView(self))
+        self.add_view(PainelAdminView(self))
 
     async def close(self) -> None:
         """Encerra a conexão com o banco de dados antes de desligar o bot."""
@@ -113,7 +123,9 @@ class BotDeDesabafos(discord.Client):
         except discord.HTTPException as exc:
             log.erro("Falha ao sincronizar comandos slash", exc)
 
-        await self._garantir_painel()
+        # v4.0: o painel deixa de ser enviado automaticamente. Use
+        # `/painel enviar` (ou `/painel admin` para o painel de
+        # configuração) sempre que quiser publicá-lo ou republicá-lo.
 
         if not self._tarefas_background:
             self._tarefas_background = scheduler.iniciar_tarefas_em_background(
@@ -130,45 +142,62 @@ class BotDeDesabafos(discord.Client):
         self._tentativas_reconexao += 1
         log.reconexao(self._tentativas_reconexao)
 
-    async def _garantir_painel(self) -> None:
+    async def _garantir_painel(self, forcar: bool = False) -> bool:
         """
-        Garante que o painel permanente ('Iniciar Conversa') está
-        publicado no canal configurado, publicando-o apenas uma vez
-        (o id da mensagem fica salvo no SQLite para sobreviver a
-        reinícios do bot).
+        Publica o painel permanente ('Iniciar Conversa') no canal
+        configurado. Por padrão, não publica de novo se já existir um
+        (o id da mensagem fica salvo no SQLite); `forcar=True` sempre
+        publica um novo, para uso pelo comando `/painel enviar`.
+
+        Retorna True se um painel foi publicado (ou já existia), e
+        False se não foi possível (canal ausente ou erro de permissão).
         """
         canal_id = self._config.canal_painel
         if not canal_id:
-            return
+            return False
 
         canal = self.get_channel(canal_id)
         if canal is None:
             log.aviso("Canal do painel não encontrado; verifique a variável CANAL_DESABAFOS.")
-            return
+            return False
 
-        mensagem_id_salva = self._db.obter_configuracao("painel_mensagem_id")
-        if mensagem_id_salva:
-            try:
-                await canal.fetch_message(int(mensagem_id_salva))
-                return  # o painel já existe, nada a fazer
-            except discord.NotFound:
-                pass  # a mensagem foi apagada; publica uma nova abaixo
-            except (discord.HTTPException, ValueError) as exc:
-                log.erro("Falha ao verificar o painel existente", exc)
-                return
+        if not forcar:
+            mensagem_id_salva = self._db.obter_configuracao("painel_mensagem_id")
+            if mensagem_id_salva:
+                try:
+                    await canal.fetch_message(int(mensagem_id_salva))
+                    return True  # o painel já existe, nada a fazer
+                except discord.NotFound:
+                    pass  # a mensagem foi apagada; publica uma nova abaixo
+                except (discord.HTTPException, ValueError) as exc:
+                    log.erro("Falha ao verificar o painel existente", exc)
+                    return False
 
         try:
             mensagem = await canal.send(embed=ui.montar_embed_painel(), view=ui.PainelView(self))
             await self._db.definir_configuracao("painel_mensagem_id", str(mensagem.id))
-            log.info(f"Painel publicado em '#{canal}'.")
+            log.painel_enviado("principal", canal.name)
+            return True
         except discord.HTTPException as exc:
             log.erro("Falha ao publicar o painel", exc)
+            return False
 
     async def on_message(self, message: discord.Message) -> None:
         """
         Processa mensagens apenas dentro de canais de ticket (sessões
         privadas) ativos. Mensagens em qualquer outro canal (incluindo o
         canal do painel) são ignoradas.
+
+        v4.0 — cada sessão tem um `modo`:
+            - "ia": fluxo normal, a IA responde diretamente à pessoa;
+            - "observador": um Helper humano assumiu; a IA só registra,
+              nunca responde;
+            - "cooperacao": a IA sugere uma resposta, mas apenas o
+              Helper a vê (por DM) — nunca é enviada à pessoa.
+
+        Uma mensagem de um membro com cargo de Staff/Helper dentro do
+        ticket, enquanto o modo ainda é "ia", pausa a IA automaticamente
+        (equivalente a rodar `/ia pausar`).
         """
         if message.author.bot:
             return
@@ -177,6 +206,44 @@ class BotDeDesabafos(discord.Client):
         if sessao is None:
             return
 
+        if message.author.id != sessao.user_id:
+            await self._processar_mensagem_de_apoio(message, sessao)
+            return
+
+        await self._processar_mensagem_do_usuario(message, sessao)
+
+    async def _processar_mensagem_de_apoio(self, message: discord.Message, sessao) -> None:
+        """
+        Mensagem de alguém que não é o dono do ticket (Staff/Helper,
+        já que o canal só é visível para eles + o próprio usuário). Se
+        a sessão ainda estiver em Modo IA, assumir pausa automaticamente.
+        """
+        if not self._eh_membro_de_apoio(message.author):
+            return  # defensivo: não deveria acontecer, dado as permissões do canal
+
+        await self._tickets.registrar_mensagem(sessao.id, "helper", message.content, None)
+
+        if sessao.modo == "ia":
+            await self._tickets.pausar_ia(sessao.id, message.author.id)
+            try:
+                await message.channel.send(
+                    f"👋 {message.author.mention} entrou na conversa. A IA foi pausada automaticamente "
+                    "(Modo Observador). Use `/ia continuar` para devolver a conversa para a IA, ou "
+                    "`/ia cooperar` para receber sugestões da IA por DM."
+                )
+            except discord.HTTPException:
+                pass
+
+    def _eh_membro_de_apoio(self, membro: discord.abc.User) -> bool:
+        """Verifica se um membro possui o cargo de Staff ou de Helper configurado."""
+        cargos_permitidos = self._config.cargos_de_apoio
+        if not cargos_permitidos or not isinstance(membro, discord.Member):
+            return False
+        ids_dos_cargos = {cargo.id for cargo in membro.roles}
+        return bool(ids_dos_cargos & set(cargos_permitidos))
+
+    async def _processar_mensagem_do_usuario(self, message: discord.Message, sessao) -> None:
+        """Mensagem da pessoa dona do ticket — o comportamento depende do modo atual da sessão."""
         usuario_id = message.author.id
         conteudo = message.content
 
@@ -193,11 +260,17 @@ class BotDeDesabafos(discord.Client):
 
         emocao = emotion.classificar(conteudo)
 
-        # A detecção de crise tem prioridade sobre o cooldown: uma pessoa
-        # em risco nunca deve ser bloqueada por causa de mensagens seguidas.
+        # A detecção de crise tem prioridade sobre tudo: mesmo em Modo
+        # Observador/Cooperação, uma pessoa em risco recebe a resposta de
+        # segurança imediatamente.
         resultado_crise = crisis.analisar(conteudo)
         if resultado_crise.em_crise:
             await self._tratar_crise(message, sessao, conteudo, emocao)
+            return
+
+        if sessao.modo == "observador":
+            # Um Helper humano está no controle: a IA apenas registra.
+            await self._tickets.registrar_mensagem(sessao.id, "user", conteudo, emocao)
             return
 
         if self._cooldown.em_cooldown(usuario_id):
@@ -209,7 +282,42 @@ class BotDeDesabafos(discord.Client):
         self._cooldown.registrar_uso(usuario_id)
         await self._db.registrar_usuario_visto(usuario_id)
 
+        if sessao.modo == "cooperacao":
+            await self._sugerir_para_helper(message, sessao, conteudo, emocao)
+            return
+
         await self._responder(message, sessao, conteudo, emocao)
+
+    # ------------------------------------------------------------------
+    # Modo Cooperação (IA + Helper humano)
+    # ------------------------------------------------------------------
+
+    async def _sugerir_para_helper(self, message: discord.Message, sessao, conteudo: str, emocao: str) -> None:
+        """
+        No Modo Cooperação, a IA nunca responde diretamente à pessoa:
+        gera uma sugestão e a envia apenas por DM ao Helper responsável.
+        """
+        await self._tickets.registrar_mensagem(sessao.id, "user", conteudo, emocao)
+
+        if not sessao.helper_id:
+            return  # sem Helper definido, não há para quem sugerir
+
+        try:
+            historico = self._memoria.obter_historico(sessao.id)
+            sugestao = await self._ia.gerar_resposta(
+                historico, conteudo, usuario_id=sessao.id, system_prompt=PROMPT_COOPERACAO
+            )
+        except ErroDeIA as exc:
+            log.erro("Falha ao gerar sugestão para o Helper (Modo Cooperação)", exc)
+            return
+
+        try:
+            helper = await self.fetch_user(sessao.helper_id)
+            await helper.send(
+                f"💡 **Sugestão para a sessão #{sessao.id}** (apenas você vê isto):\n\n{sugestao}"
+            )
+        except discord.HTTPException as exc:
+            log.erro("Falha ao enviar sugestão por DM ao Helper", exc)
 
     # ------------------------------------------------------------------
     # Detecção de crise
@@ -219,10 +327,14 @@ class BotDeDesabafos(discord.Client):
         """
         Interrompe o fluxo normal de IA e responde com uma mensagem de
         segurança fixa, determinística, sempre que houver indícios
-        graves de risco à vida na mensagem da pessoa.
+        graves de risco à vida na mensagem da pessoa. Também pausa a IA
+        automaticamente (Modo Observador), para que um Helper humano
+        precise assumir explicitamente a conversa a partir daqui.
         """
         await self._tickets.registrar_mensagem(sessao.id, "user", conteudo, emocao)
         await self._tickets.marcar_crise(sessao.id)
+        if sessao.modo == "ia":
+            await self._tickets.pausar_ia(sessao.id, helper_id=None)
 
         resposta = crisis.RESPOSTA_DE_SEGURANCA
         if self._config.enable_crisis_mode and self._config.staff_role_id:
@@ -414,7 +526,7 @@ class BotDeDesabafos(discord.Client):
 
         canal = interaction.channel or self.get_channel(sessao.channel_id)
         if canal is not None:
-            await self._tickets.encerrar_definitivamente(sessao, canal, self._ia, self._config)
+            await self._tickets.encerrar_definitivamente(sessao, canal, self._ia, self._config, client=self)
 
     async def continuar_apos_aviso(self, interaction: discord.Interaction) -> None:
         """Cancela um fechamento pendente após o aviso de inatividade."""
@@ -432,7 +544,7 @@ class BotDeDesabafos(discord.Client):
     # ------------------------------------------------------------------
 
     def _registrar_comandos(self) -> None:
-        """Registra os comandos slash /health e /version na árvore de comandos."""
+        """Registra os comandos slash: /health, /version, /painel e /ia."""
 
         @self.tree.command(name="health", description="Mostra o status atual do bot e dos serviços conectados.")
         async def health(interaction: discord.Interaction) -> None:
@@ -441,6 +553,103 @@ class BotDeDesabafos(discord.Client):
         @self.tree.command(name="version", description="Mostra a versão atual do bot.")
         async def version_cmd(interaction: discord.Interaction) -> None:
             await self._comando_version(interaction)
+
+        grupo_painel = app_commands.Group(
+            name="painel", description="Publica os painéis do bot (apenas administradores)."
+        )
+
+        @grupo_painel.command(name="enviar", description="Publica (ou republica) o painel 'Iniciar Conversa'.")
+        async def painel_enviar(interaction: discord.Interaction) -> None:
+            if not self._eh_administrador(interaction):
+                await interaction.response.send_message("Apenas administradores podem usar este comando.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            sucesso = await self._garantir_painel(forcar=True)
+            if sucesso:
+                await interaction.followup.send("Painel publicado! 💜", ephemeral=True)
+            else:
+                await interaction.followup.send(
+                    "Não consegui publicar o painel — verifique `CANAL_DESABAFOS` e as permissões do bot no canal.",
+                    ephemeral=True,
+                )
+
+        @grupo_painel.command(name="admin", description="Abre o painel administrativo (configurações da LORA).")
+        async def painel_admin(interaction: discord.Interaction) -> None:
+            if not self._eh_administrador(interaction):
+                await interaction.response.send_message("Apenas administradores podem usar este comando.", ephemeral=True)
+                return
+            await interaction.response.send_message(embed=montar_embed_admin(), view=PainelAdminView(self), ephemeral=True)
+
+        self.tree.add_command(grupo_painel)
+
+        grupo_ia = app_commands.Group(
+            name="ia", description="Controla a IA dentro de uma conversa privada (Staff/Helper)."
+        )
+
+        @grupo_ia.command(name="pausar", description="Pausa a IA nesta conversa (Modo Observador) e assume o atendimento.")
+        async def ia_pausar(interaction: discord.Interaction) -> None:
+            await self._comando_ia_pausar(interaction)
+
+        @grupo_ia.command(name="continuar", description="Devolve a conversa para a IA (encerra o Modo Observador/Cooperação).")
+        async def ia_continuar(interaction: discord.Interaction) -> None:
+            await self._comando_ia_continuar(interaction)
+
+        @grupo_ia.command(
+            name="cooperar",
+            description="Ativa o Modo Cooperação: a IA sugere respostas só para você, por DM, sem falar com a pessoa.",
+        )
+        async def ia_cooperar(interaction: discord.Interaction) -> None:
+            await self._comando_ia_cooperar(interaction)
+
+        self.tree.add_command(grupo_ia)
+
+    @staticmethod
+    def _eh_administrador(interaction: discord.Interaction) -> bool:
+        permissoes = getattr(interaction.user, "guild_permissions", None)
+        return bool(permissoes and permissoes.administrator)
+
+    async def _verificar_comando_ia(self, interaction: discord.Interaction) -> "Sessao | None":
+        """Validações comuns aos subcomandos de /ia: canal de ticket + permissão de Staff/Helper."""
+        if interaction.channel_id is None:
+            await interaction.response.send_message("Use este comando dentro do canal de um ticket.", ephemeral=True)
+            return None
+
+        sessao = await self._tickets.sessao_por_canal(interaction.channel_id)
+        if sessao is None:
+            await interaction.response.send_message("Este não é um canal de ticket ativo.", ephemeral=True)
+            return None
+
+        if not self._eh_administrador(interaction) and not self._eh_membro_de_apoio(interaction.user):
+            await interaction.response.send_message("Apenas a equipe de apoio pode usar este comando.", ephemeral=True)
+            return None
+
+        return sessao
+
+    async def _comando_ia_pausar(self, interaction: discord.Interaction) -> None:
+        sessao = await self._verificar_comando_ia(interaction)
+        if sessao is None:
+            return
+        await self._tickets.pausar_ia(sessao.id, interaction.user.id)
+        await interaction.response.send_message(
+            "IA pausada — você está no controle da conversa agora (Modo Observador).", ephemeral=True
+        )
+
+    async def _comando_ia_continuar(self, interaction: discord.Interaction) -> None:
+        sessao = await self._verificar_comando_ia(interaction)
+        if sessao is None:
+            return
+        await self._tickets.retomar_ia(sessao.id)
+        await interaction.response.send_message("A IA está de volta ao controle desta conversa.", ephemeral=True)
+
+    async def _comando_ia_cooperar(self, interaction: discord.Interaction) -> None:
+        sessao = await self._verificar_comando_ia(interaction)
+        if sessao is None:
+            return
+        await self._tickets.ativar_cooperacao(sessao.id, interaction.user.id)
+        await interaction.response.send_message(
+            "Modo Cooperação ativado: a IA vai te enviar sugestões por DM, sem responder diretamente à pessoa.",
+            ephemeral=True,
+        )
 
     async def _comando_health(self, interaction: discord.Interaction) -> None:
         """Implementação do comando /health."""
@@ -452,6 +661,7 @@ class BotDeDesabafos(discord.Client):
         fechadas = await self._db.contar_sessoes_fechadas()
         estatisticas = await self._db.obter_estatisticas_completas()
         backup_info = await self._db.ultimo_backup_info()
+        media_avaliacoes, total_avaliacoes = await self._db.obter_media_avaliacoes()
 
         embed = discord.Embed(title="🌙 Status do LORA", color=discord.Color.blurple())
         embed.add_field(name="Discord", value=f"🟢 Conectado ({self.latency * 1000:.0f}ms)", inline=True)
@@ -462,14 +672,14 @@ class BotDeDesabafos(discord.Client):
             embed.add_field(
                 name="Gemini",
                 value=f"{_emoji_status(status_provedores['gemini'])} {status_provedores['gemini']} "
-                f"({self._config.model_name})",
+                f"({self._ia.modelo_gemini_atual()})",
                 inline=True,
             )
         if "groq" in status_provedores:
             embed.add_field(
                 name="Groq",
                 value=f"{_emoji_status(status_provedores['groq'])} {status_provedores['groq']} "
-                f"({self._config.groq_model_name})",
+                f"({self._ia.modelo_groq_atual()})",
                 inline=True,
             )
 
@@ -486,6 +696,11 @@ class BotDeDesabafos(discord.Client):
         embed.add_field(name="Uso de memória", value=f"{uso_memoria_mb():.1f} MB", inline=True)
         embed.add_field(name="Último backup", value=backup_info or "nenhum ainda", inline=True)
         embed.add_field(name="Watchdog", value="🟢 Ativo", inline=True)
+        embed.add_field(
+            name="Avaliação média",
+            value=f"⭐ {media_avaliacoes:.1f} ({total_avaliacoes} avaliações)" if total_avaliacoes else "sem avaliações ainda",
+            inline=True,
+        )
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -501,10 +716,10 @@ class BotDeDesabafos(discord.Client):
         embed = discord.Embed(title="🌙 Versão do LORA", color=discord.Color.green())
         embed.add_field(name="Versão", value=version.VERSAO, inline=True)
         embed.add_field(name="Build", value=version.DATA_BUILD, inline=True)
-        embed.add_field(name="Arquitetura", value="Sessões privadas (tickets)", inline=True)
+        embed.add_field(name="Arquitetura", value="Sessões privadas + Helper humano (híbrido IA/humano)", inline=True)
         embed.add_field(name="Módulos", value=str(quantidade_modulos), inline=True)
-        embed.add_field(name="Modelo Gemini", value=self._config.model_name, inline=True)
-        embed.add_field(name="Modelo Groq", value=self._config.groq_model_name, inline=True)
+        embed.add_field(name="Modelo Gemini", value=self._ia.modelo_gemini_atual(), inline=True)
+        embed.add_field(name="Modelo Groq", value=self._ia.modelo_groq_atual(), inline=True)
         embed.add_field(name="Provedor prioritário", value=provedor_ativo, inline=True)
         embed.add_field(name="Banco de dados", value=f"SQLite ({self._config.db_path})", inline=False)
 

@@ -122,7 +122,7 @@ async def loop_fechamento_automatico(
 
                 horas_inativa = (agora - ultima_atividade).total_seconds() / 3600
 
-                if not sessao.aviso_inatividade_enviado and horas_inativa >= config.auto_close_horas:
+                if not sessao.aviso_inatividade_enviado and horas_inativa >= tickets.auto_close_horas_efetivo():
                     try:
                         await canal.send(
                             "Faz um tempo que a gente não conversa por aqui. Posso encerrar esta "
@@ -134,10 +134,10 @@ async def loop_fechamento_automatico(
                         log.erro(f"Falha ao enviar aviso de inatividade da sessão #{sessao.id}", exc)
 
                 elif sessao.aviso_inatividade_enviado and horas_inativa >= (
-                    config.auto_close_horas + config.auto_close_tolerancia_horas
+                    tickets.auto_close_horas_efetivo() + config.auto_close_tolerancia_horas
                 ):
                     try:
-                        await tickets.encerrar_definitivamente(sessao, canal, ia, config)
+                        await tickets.encerrar_definitivamente(sessao, canal, ia, config, client=client)
                     except Exception as exc:  # noqa: BLE001
                         log.erro(f"Falha ao encerrar automaticamente a sessão #{sessao.id}", exc)
 

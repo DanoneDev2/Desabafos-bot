@@ -14,7 +14,21 @@ import discord
 import logger as log
 from config import config
 from database import Database
+from event_bus import bus
 from events import BotDeDesabafos
+
+
+def _registrar_ouvintes_padrao() -> None:
+    """
+    Ouvintes mínimos do Event Bus, apenas para log — servem de exemplo
+    concreto de como um módulo futuro (música, timeline, analytics,
+    base de conhecimento...) pode se inscrever em eventos do bot sem
+    precisar alterar nenhum módulo existente.
+    """
+    bus.on("sessao_criada", lambda **d: log.info(f"[evento] sessao_criada: {d}"))
+    bus.on("sessao_encerrada", lambda **d: log.info(f"[evento] sessao_encerrada: sessão #{d.get('session_id')}"))
+    bus.on("helper_entrou", lambda **d: log.info(f"[evento] helper_entrou: {d}"))
+    bus.on("avaliacao_recebida", lambda **d: log.info(f"[evento] avaliacao_recebida: {d}"))
 
 
 def main() -> None:
@@ -28,6 +42,8 @@ def main() -> None:
 
     log.configurar_arquivo("dados/logs/bot.log", config.logs_retencao_dias)
     log.info("Iniciando Bot de Desabafos...")
+
+    _registrar_ouvintes_padrao()
 
     db = Database(caminho_db=config.db_path, pasta_backup=config.db_backup_dir)
     bot = BotDeDesabafos(config, db)

@@ -10,6 +10,13 @@ especializado de resumo.
 Emoções detectadas não são geradas aqui: são classificadas mensagem a
 mensagem por `emotion.py` (heurística, sem custo de API) e agregadas
 pelo chamador (`events.py`) ao fechar a sessão.
+
+IMPORTANTE (v4.0): mensagens com role="helper" (registradas quando um
+humano assume a conversa no Modo Observador/Cooperação) são sempre
+excluídas do histórico enviado à IA — elas não fazem parte da
+alternância user/model que os provedores esperam, e o resumo deve
+refletir a conversa entre a pessoa e a IA/o Helper, não instruções
+internas da equipe.
 """
 
 from __future__ import annotations
@@ -18,17 +25,7 @@ from dataclasses import dataclass
 
 import logger as log
 from ai import ErroDeIA, ProvedorDeIA
-
-_PROMPT_RESUMO = (
-    "Você vai analisar uma conversa de apoio emocional já encerrada e produzir "
-    "um resumo estruturado, para servir de contexto em uma futura conversa com "
-    "a mesma pessoa. Responda ESTRITAMENTE no formato abaixo, em português, de "
-    "forma objetiva (1 a 3 frases por campo). Não escreva nada fora deste formato.\n\n"
-    "RESUMO: <resumo geral da conversa>\n"
-    "ASSUNTOS: <principais assuntos, separados por vírgula>\n"
-    "PREOCUPACOES: <principais preocupações mencionadas, separadas por vírgula>\n"
-    "OBJETIVOS: <objetivos ou desejos mencionados pela pessoa, separados por vírgula>"
-)
+from prompts import PROMPT_RESUMO
 
 _CAMPOS = {
     "RESUMO": "resumo",
@@ -76,7 +73,9 @@ def _resumo_heuristico(mensagens: list[dict]) -> ResumoDeSessao:
     return ResumoDeSessao(resumo=amostra or "Conversa encerrada sem conteúdo suficiente para resumo.")
 
 
-async def gerar_resumo(ia: ProvedorDeIA, mensagens: list[dict], modelo: str = "") -> ResumoDeSessao:
+async def gerar_resumo(
+    ia: ProvedorDeIA, mensagens: list[dict], modelo: str = "", prompt_resumo: str = ""
+) -> ResumoDeSessao:
     """
     Gera o resumo estruturado de uma sessão encerrada.
 
@@ -86,15 +85,20 @@ async def gerar_resumo(ia: ProvedorDeIA, mensagens: list[dict], modelo: str = ""
 
     Args:
         ia: instância compartilhada de ProvedorDeIA (mesma fila/retry/circuit breaker).
-        mensagens: mensagens brutas da sessão, em ordem cronológica.
-        modelo: nome do modelo usado (apenas para fins de log).
+        mensagens: mensagens brutas da sessão, em ordem cronológica (podem
+            incluir mensagens de Helper, que são sempre ignoradas aqui).
+        modelo: nome do modelo usado para este resumo (SUMMARY_MODEL).
+        prompt_resumo: prompt de resumo customizado (do painel administrativo);
+            usa `PROMPT_RESUMO` como padrão se vazio.
     """
-    if not mensagens:
+    conversa = [m for m in mensagens if m.get("role") in ("user", "assistant")]
+    if not conversa:
         return ResumoDeSessao(resumo="Conversa encerrada sem mensagens.")
 
-    historico = [{"role": m["role"], "content": m["content"]} for m in mensagens[:-1]]
-    ultima_mensagem = mensagens[-1]["content"]
-    pedido_de_resumo = f"{_PROMPT_RESUMO}\n\nÚltima mensagem da pessoa: {ultima_mensagem}"
+    historico = [{"role": m["role"], "content": m["content"]} for m in conversa[:-1]]
+    ultima_mensagem = conversa[-1]["content"]
+    texto_prompt = prompt_resumo or PROMPT_RESUMO
+    pedido_de_resumo = f"{texto_prompt}\n\nÚltima mensagem da pessoa: {ultima_mensagem}"
 
     try:
         resposta = await ia.gerar_resposta(historico, pedido_de_resumo, modelo=modelo or None)

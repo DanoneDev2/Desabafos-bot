@@ -94,6 +94,82 @@ aplicados por sessão em vez de por canal fixo.
 
 ---
 
+## Novidades da v4.0 (Fase 1) — Administração pelo Discord + Helper humano
+
+A v4.0, como pedida, é uma transformação enorme: transformar a LORA em
+uma plataforma completa de atendimento (painel administrativo total,
+música terapêutica, perfil psicológico, timeline, dashboard em tempo
+real, transcripts em HTML, plugins independentes, etc.). Isso é, com
+honestidade, meses de trabalho de um time — não algo que se entrega de
+forma sólida e testada em uma única passada. Por isso esta atualização
+foi dividida em fases, seguindo o mesmo princípio de "nada quebra"
+pedido no prompt.
+
+**O que esta Fase 1 entrega, de verdade, testado e funcionando:**
+
+- **Painel administrativo pelo Discord** (`/painel admin`): ajusta
+  temperatura, modelos (Gemini/Groq), prompt geral, horas de
+  auto-close e limite de sessões — tudo salvo no SQLite e aplicado
+  **imediatamente, sem reiniciar o bot** (`admin_panel.py`). Cobre os
+  ajustes de maior impacto no dia a dia; ainda não cobre a edição de
+  cada embed do projeto (ver "próximas fases" abaixo).
+- **Painel enviado só por comando** (`/painel enviar`): o envio
+  automático foi removido, exatamente como pedido. Pode ser
+  reenviado quando quiser.
+- **Sistema de Helper humano** (`/ia pausar`, `/ia continuar`,
+  `/ia cooperar`): quando alguém com cargo de Staff/Helper escreve
+  dentro de um ticket, a IA pausa automaticamente (Modo Observador —
+  só registra, nunca responde). O Helper devolve o controle com
+  `/ia continuar`.
+- **Modo Cooperação**: a IA gera uma sugestão de resposta e a envia
+  **só por DM ao Helper** — nunca fala diretamente com a pessoa nesse
+  modo. Bom para treinamento de voluntários, como pedido.
+- **Handoff automático em crise**: além da resposta de segurança já
+  existente (v3.0), uma crise detectada agora também pausa a IA
+  automaticamente, obrigando um Helper a assumir explicitamente.
+- **Avaliação pós-atendimento** (`avaliacao.py`): ao encerrar uma
+  sessão, a pessoa recebe por DM um convite para avaliar de 1 a 5
+  estrelas + comentário opcional. Avaliações de 1-2 estrelas já
+  incrementam uma estatística própria (`avaliacoes_negativas`),
+  visível no banco — a base honesta para uma futura análise mais fina
+  do "Feedback para IA", sem inventar uma automação que ainda não existe.
+- **Prompts modulares**: `PROMPT_RESUMO` e `PROMPT_COOPERACAO` isolados
+  em `prompts.py` (junto do `SYSTEM_PROMPT` já existente), todos
+  sobrescrevíveis pelo painel administrativo.
+- **Event Bus interno** (`event_bus.py`): `sessao_criada`,
+  `sessao_encerrada`, `crise_detectada`, `resumo_criado`,
+  `helper_entrou`, `ia_retomada` e `avaliacao_recebida` já são
+  emitidos pelo projeto — a base concreta para os plugins
+  independentes (música, timeline, analytics...) pedidos, sem exigir
+  nenhuma mudança nos módulos existentes para plugá-los no futuro.
+
+**Deliberadamente fora desta fase** (para não entregar 20 recursos pela
+metade em vez de alguns poucos completos e confiáveis):
+
+- Edição de **todos** os embeds do projeto pelo painel (título, cor,
+  footer, imagem, botões...) — hoje só os textos-chave de IA/Tickets
+  são editáveis. Os embeds continuam definidos em `ui.py`/`admin_panel.py`.
+- **Playlist terapêutica** (envio de áudio por emoção): exige um
+  sistema de upload/gestão de arquivos que o projeto ainda não tem.
+- **Perfil psicológico evolutivo e "detecção de melhora/piora"**: esse
+  tipo de avaliação clínica automática, se mal calibrada, pode levar
+  Helpers a confiar demais em um "diagnóstico" gerado por IA sobre uma
+  pessoa vulnerável — prefiro entregar isso com mais cuidado numa fase
+  dedicada, com o rótulo bem claro de que é heurística, não diagnóstico.
+- **Timeline visual, dashboard em tempo real e transcripts HTML
+  premium**: viáveis, mas cada um é, sozinho, um projeto de front-end à
+  parte; ficam para as próximas fases.
+- **Base de conhecimento modular e plugin system com carregamento
+  dinâmico de arquivos**: o Event Bus desta fase já é o alicerce para
+  isso — os módulos plugáveis em si (`music/`, `knowledge/` etc.)
+  ficam para quando houver uma necessidade concreta de um deles.
+
+Nada do que já existia (fila, retry, circuit breaker, fallback
+Gemini/Groq, banco SQLite, tickets privados) foi alterado em sua
+interface pública — só estendido.
+
+---
+
 ## Índice
 
 1. [Estrutura do projeto](#estrutura-do-projeto)
@@ -118,18 +194,21 @@ desabafos-bot/
 ├── main.py            # Ponto de entrada do bot
 ├── config.py          # Carrega e valida configurações do .env
 ├── ai.py              # IA (Gemini + fallback Groq, fila, retry, circuit breaker)
-├── prompts.py          # Prompt de sistema / personalidade da IA
+├── prompts.py          # Prompts modulares (geral, resumo, cooperação)
 ├── memory.py           # Histórico de conversa isolado por sessão + resumo automático
-├── database.py         # SQLite: sessions, messages, blacklist, config, backup
-├── ticket_manager.py    # Ciclo de vida das sessões privadas (tickets)
-├── ui.py               # Painel e botões (Iniciar/Encerrar Conversa)
+├── database.py         # SQLite: sessions, messages, avaliações, blacklist, config, backup
+├── ticket_manager.py    # Ciclo de vida das sessões privadas (tickets) + Helper humano
+├── ui.py               # Painel principal e botões (Iniciar/Encerrar Conversa)
+├── admin_panel.py       # Painel administrativo (/painel admin) — Fase 1
+├── avaliacao.py         # Avaliação pós-atendimento (⭐ + comentário, por DM)
+├── event_bus.py         # Barramento de eventos interno (base para plugins futuros)
 ├── crisis.py            # Detecção determinística de risco à vida
 ├── emotion.py            # Classificação leve de emoção por mensagem
 ├── summarizer.py         # Resumo estruturado gerado ao encerrar uma sessão
 ├── streaming.py          # Interfaces desacopladas p/ streaming futuro
 ├── scheduler.py         # Tarefas periódicas: backup, limpeza, watchdog, auto-close
 ├── version.py           # Versão e data de build (usados no /version)
-├── events.py           # Eventos do Discord + comandos /health e /version
+├── events.py           # Eventos do Discord + comandos slash (/health, /version, /painel, /ia)
 ├── logger.py           # Sistema de logs coloridos (terminal + arquivo)
 ├── utils.py            # Cooldown, validação de mensagens, backoff e detecção de erros
 ├── requirements.txt    # Dependências do projeto
@@ -215,10 +294,10 @@ TOKEN_DISCORD=seu_token_aqui
 CANAL_DESABAFOS=123456789012345678
 
 API_KEY_GEMINI=sua_chave_gemini
-MODEL_NAME=gemini-2.5-flash
+MODEL_NAME=gemini-1.5-flash
 
 API_KEY_GROQ=sua_chave_groq
-GROQ_MODEL_NAME=llama-3.3-70b-versatile
+GROQ_MODEL_NAME=llama-3.1-70b-versatile
 
 TEMPERATURE=0.9
 MAX_HISTORY=10
@@ -250,6 +329,24 @@ Se tudo estiver correto, você verá no terminal:
 [12:00:00] INFO     | Iniciando Bot de Desabafos...
 [12:00:02] INFO     | Bot conectado como SeuBot#0000 em 1 servidor(es).
 ```
+
+Depois disso, publique o painel principal com `/painel enviar` (veja
+"Comandos disponíveis" abaixo) — a partir da v4.0 ele não é mais
+publicado sozinho.
+
+---
+
+## Comandos disponíveis
+
+| Comando | Quem pode usar | O que faz |
+|---|---|---|
+| `/painel enviar` | Administradores | Publica (ou republica) o painel "Iniciar Conversa" |
+| `/painel admin` | Administradores | Abre o painel administrativo (IA e Tickets, com efeito imediato) |
+| `/ia pausar` | Staff/Helper (dentro de um ticket) | Pausa a IA e assume a conversa (Modo Observador) |
+| `/ia continuar` | Staff/Helper (dentro de um ticket) | Devolve a conversa para a IA |
+| `/ia cooperar` | Staff/Helper (dentro de um ticket) | Ativa o Modo Cooperação (sugestões da IA só por DM) |
+| `/health` | Qualquer pessoa | Status do bot, IA, banco, fila, tickets e avaliações |
+| `/version` | Qualquer pessoa | Versão, build e configuração ativa do bot |
 
 ---
 
@@ -352,6 +449,9 @@ adicionadas, e você precisará copiá-las para o seu `.env` existente.
 | Botão "Iniciar Conversa" não cria o canal | `CATEGORY_TICKETS` ausente/incorreto e `ENABLE_PRIVATE_THREADS=false` | Defina `CATEGORY_TICKETS` com o ID de uma categoria válida, ou ative `ENABLE_PRIVATE_THREADS=true` |
 | Painel não aparece / aparece duplicado | Mensagem do painel foi apagada manualmente, ou o bot não tem permissão no canal | O bot detecta e republica automaticamente se a mensagem salva não existir mais; confira as permissões do canal |
 | "Você já possui uma conversa ativa" mesmo sem canal visível | O canal do ticket foi apagado manualmente, sem passar pelo botão de encerrar | Encerre a sessão pendente diretamente no banco (`sessions`, coluna `status`) ou aguarde o fechamento automático |
+| Painel não aparece depois de iniciar o bot | A partir da v4.0 ele não é mais enviado automaticamente | Rode `/painel enviar` (precisa de permissão de administrador) |
+| Staff/Helper escreveu no ticket e a IA não pausou | O membro não tem `STAFF_ROLE_ID` nem `HELPER_ROLE_ID` atribuído | Confirme os cargos no `.env`/painel administrativo, ou use `/ia pausar` manualmente |
+| Ajustei algo no `/painel admin` e nada mudou | Campo deixado em branco no formulário (só altera o que for preenchido) | Reabra `/painel admin` e preencha o campo desejado |
 
 ---
 

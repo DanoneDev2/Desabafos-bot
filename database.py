@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 
 import logger as log
 
-VERSAO_SCHEMA_ATUAL = 2
+VERSAO_SCHEMA_ATUAL = 3
 
 # Definição das tabelas geridas pela migração automática.
 _TABELAS: dict[str, str] = {
@@ -94,6 +94,17 @@ _TABELAS: dict[str, str] = {
             created_at TEXT NOT NULL
         )
     """,
+    # --- Helpers humanos e avaliação (v4.0) --------------------------------
+    "avaliacoes": """
+        CREATE TABLE IF NOT EXISTS avaliacoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            estrelas INTEGER NOT NULL,
+            comentario TEXT,
+            criado_em TEXT NOT NULL
+        )
+    """,
 }
 
 # Colunas esperadas por tabela — usado pela migração para ADICIONAR
@@ -108,6 +119,8 @@ _COLUNAS_ESPERADAS: dict[str, dict[str, str]] = {
         "emotion": "TEXT",
         "aviso_inatividade_enviado": "INTEGER NOT NULL DEFAULT 0",
         "crise_detectada": "INTEGER NOT NULL DEFAULT 0",
+        "modo": "TEXT NOT NULL DEFAULT 'ia'",
+        "helper_id": "INTEGER",
     },
     "messages": {
         "emotion": "TEXT",
@@ -554,6 +567,61 @@ class Database:
 
         await asyncio.to_thread(_sync)
         await self.incrementar_estatistica("crises_detectadas")
+
+    # ------------------------------------------------------------------
+    # Helpers humanos e avaliação (v4.0)
+    # ------------------------------------------------------------------
+
+    async def definir_modo_sessao(self, session_id: int, modo: str, helper_id: int | None = None) -> None:
+        """
+        Define o modo de atendimento da sessão: 'ia' (padrão), 'observador'
+        (a IA para de responder enquanto um Helper humano assume) ou
+        'cooperacao' (a IA sugere respostas apenas para o Helper ver).
+        """
+        if modo not in ("ia", "observador", "cooperacao"):
+            raise ValueError(f"Modo de sessão inválido: {modo}")
+
+        def _sync() -> None:
+            assert self._conexao is not None
+            self._conexao.execute(
+                "UPDATE sessions SET modo = ?, helper_id = ? WHERE id = ?",
+                (modo, helper_id, session_id),
+            )
+            self._conexao.commit()
+
+        await asyncio.to_thread(_sync)
+
+    async def salvar_avaliacao(
+        self, session_id: int, user_id: int, estrelas: int, comentario: str | None = None
+    ) -> None:
+        """Salva a avaliação (1 a 5 estrelas + comentário opcional) dada após o encerramento de uma sessão."""
+        agora = _agora_iso()
+
+        def _sync() -> None:
+            assert self._conexao is not None
+            self._conexao.execute(
+                "INSERT INTO avaliacoes (session_id, user_id, estrelas, comentario, criado_em) VALUES (?, ?, ?, ?, ?)",
+                (session_id, user_id, estrelas, comentario, agora),
+            )
+            self._conexao.commit()
+
+        await asyncio.to_thread(_sync)
+        await self.incrementar_estatistica("avaliacoes_recebidas")
+        if estrelas <= 2:
+            await self.incrementar_estatistica("avaliacoes_negativas")
+
+    async def obter_media_avaliacoes(self) -> tuple[float, int]:
+        """Retorna a (média de estrelas, quantidade de avaliações) — usado no /health."""
+
+        def _sync() -> tuple[float, int]:
+            assert self._conexao is not None
+            row = self._conexao.execute(
+                "SELECT AVG(estrelas) AS media, COUNT(*) AS total FROM avaliacoes"
+            ).fetchone()
+            media = float(row["media"]) if row["media"] is not None else 0.0
+            return media, int(row["total"])
+
+        return await asyncio.to_thread(_sync)
 
     async def listar_sessoes_abertas_para_verificacao(self) -> list[dict]:
         """Retorna todas as sessões abertas, para a rotina de fechamento automático avaliar inatividade."""

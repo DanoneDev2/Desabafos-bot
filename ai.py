@@ -23,8 +23,13 @@ mas agora, internamente:
       histórico enviado (via memory.py) e uma nova tentativa;
     - é possível solicitar um modelo Gemini diferente do padrão para uma
       chamada específica (usado por `summarizer.py` via `SUMMARY_MODEL`),
-      sem mudar a assinatura pública de `gerar_resposta` para quem não
-      precisa disso.
+      e um prompt de sistema diferente do padrão (usado pelo Modo
+      Cooperação, em `events.py`), sem mudar a assinatura pública de
+      `gerar_resposta` para quem não precisa disso;
+    - se uma instância de `Database` for informada, temperatura, modelos
+      e o prompt geral passam a ter prioridade sobre um valor salvo pelo
+      painel administrativo (v4.0), caindo em `config.py`/`prompts.py`
+      como padrão caso nada tenha sido configurado.
 """
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, TYPE_CHECKING
 
 from google import genai
 from google.genai import types as genai_types
@@ -43,6 +48,9 @@ from config import Config
 from memory import GerenciadorDeMemoria
 from prompts import SYSTEM_PROMPT
 from utils import calcular_backoff, eh_erro_contexto_muito_grande, eh_erro_retentavel
+
+if TYPE_CHECKING:
+    from database import Database
 
 
 class ErroDeIA(Exception):
@@ -109,6 +117,7 @@ class _RequisicaoIA:
     usuario_id: Optional[int]
     future: "asyncio.Future[str]"
     modelo: Optional[str] = None
+    system_prompt: Optional[str] = None
 
 
 class ProvedorDeIA:
@@ -123,10 +132,12 @@ class ProvedorDeIA:
         config: Config,
         memoria: GerenciadorDeMemoria | None = None,
         registrar_estatistica: Callable[[str], Awaitable[None]] | None = None,
+        db: "Database | None" = None,
     ) -> None:
         self._config = config
         self._memoria = memoria
         self._registrar_estatistica = registrar_estatistica
+        self._db = db
 
         self._gemini_disponivel = bool(config.api_key_gemini)
         self._groq_disponivel = bool(config.api_key_groq)
@@ -145,6 +156,34 @@ class ProvedorDeIA:
         self._worker_iniciado = False
 
     # ------------------------------------------------------------------
+    # Configuração dinâmica (painel administrativo, v4.0) — sempre com
+    # fallback seguro para config.py/prompts.py caso nada esteja salvo.
+    # ------------------------------------------------------------------
+
+    def _config_efetiva(self, chave: str, padrao: str) -> str:
+        if self._db is not None:
+            valor = self._db.obter_configuracao(chave)
+            if valor:
+                return valor
+        return padrao
+
+    def _temperatura_efetiva(self) -> float:
+        bruta = self._config_efetiva("ia_temperature", str(self._config.temperature))
+        try:
+            return float(bruta)
+        except ValueError:
+            return self._config.temperature
+
+    def _prompt_geral_efetivo(self) -> str:
+        return self._config_efetiva("prompt_geral", SYSTEM_PROMPT)
+
+    def _modelo_gemini_padrao_efetivo(self) -> str:
+        return self._config_efetiva("ia_model_gemini", self._config.model_name)
+
+    def _modelo_groq_efetivo(self) -> str:
+        return self._config_efetiva("ia_model_groq", self._config.groq_model_name)
+
+    # ------------------------------------------------------------------
     # Interface pública (compatível com a versão anterior)
     # ------------------------------------------------------------------
 
@@ -154,6 +193,7 @@ class ProvedorDeIA:
         nova_mensagem: str,
         usuario_id: int | None = None,
         modelo: str | None = None,
+        system_prompt: str | None = None,
     ) -> str:
         """
         Gera uma resposta de IA. A chamada é colocada em uma fila
@@ -169,6 +209,10 @@ class ProvedorDeIA:
                 (opcional). Usado por `summarizer.py` para permitir um
                 modelo diferente (`SUMMARY_MODEL`) na geração de resumos,
                 sem afetar as conversas normais.
+            system_prompt: prompt de sistema específico para esta chamada
+                (opcional). Usado pelo Modo Cooperação (`PROMPT_COOPERACAO`)
+                para trocar a personalidade da IA sem afetar as conversas
+                normais, que continuam usando o prompt geral padrão.
 
         Returns:
             Texto de resposta gerado pela IA.
@@ -185,6 +229,7 @@ class ProvedorDeIA:
             usuario_id=usuario_id,
             future=future,
             modelo=modelo,
+            system_prompt=system_prompt,
         )
 
         try:
@@ -207,6 +252,14 @@ class ProvedorDeIA:
         """Retorna quantas requisições estão aguardando na fila assíncrona (para o /health)."""
         return self._fila.qsize()
 
+    def modelo_gemini_atual(self) -> str:
+        """Retorna o modelo Gemini efetivo (considerando um possível override salvo no painel administrativo)."""
+        return self._modelo_gemini_padrao_efetivo()
+
+    def modelo_groq_atual(self) -> str:
+        """Retorna o modelo Groq efetivo (considerando um possível override salvo no painel administrativo)."""
+        return self._modelo_groq_efetivo()
+
     # ------------------------------------------------------------------
     # Fila assíncrona (worker)
     # ------------------------------------------------------------------
@@ -223,7 +276,11 @@ class ProvedorDeIA:
             requisicao = await self._fila.get()
             try:
                 resposta = await self._gerar_com_fallback(
-                    requisicao.historico, requisicao.nova_mensagem, requisicao.usuario_id, requisicao.modelo
+                    requisicao.historico,
+                    requisicao.nova_mensagem,
+                    requisicao.usuario_id,
+                    requisicao.modelo,
+                    requisicao.system_prompt,
                 )
                 if not requisicao.future.done():
                     requisicao.future.set_result(resposta)
@@ -243,6 +300,7 @@ class ProvedorDeIA:
         nova_mensagem: str,
         usuario_id: int | None,
         modelo: str | None = None,
+        system_prompt: str | None = None,
     ) -> str:
         erros: list[str] = []
         motivo_fallback = ""
@@ -251,7 +309,7 @@ class ProvedorDeIA:
             if self._circuit_breaker.disponivel("gemini"):
                 inicio = time.monotonic()
                 try:
-                    funcao_gemini = lambda h, m: self._gerar_com_gemini(h, m, modelo)  # noqa: E731
+                    funcao_gemini = lambda h, m: self._gerar_com_gemini(h, m, modelo, system_prompt)  # noqa: E731
                     resposta = await self._gerar_com_retry(
                         "gemini", funcao_gemini, historico, nova_mensagem, usuario_id
                     )
@@ -274,8 +332,9 @@ class ProvedorDeIA:
             if self._circuit_breaker.disponivel("groq"):
                 inicio = time.monotonic()
                 try:
+                    funcao_groq = lambda h, m: self._gerar_com_groq(h, m, system_prompt)  # noqa: E731
                     resposta = await self._gerar_com_retry(
-                        "groq", self._gerar_com_groq, historico, nova_mensagem, usuario_id
+                        "groq", funcao_groq, historico, nova_mensagem, usuario_id
                     )
                     self._circuit_breaker.registrar_sucesso("groq")
                     await self._registrar("respostas_groq")
@@ -353,10 +412,15 @@ class ProvedorDeIA:
     # ------------------------------------------------------------------
 
     async def _gerar_com_gemini(
-        self, historico: list[dict[str, str]], nova_mensagem: str, modelo: str | None = None
+        self,
+        historico: list[dict[str, str]],
+        nova_mensagem: str,
+        modelo: str | None = None,
+        system_prompt: str | None = None,
     ) -> str:
         """Gera resposta usando a API do Google Gemini (SDK `google-genai`)."""
-        modelo_usado = modelo or self._config.model_name
+        modelo_usado = modelo or self._modelo_gemini_padrao_efetivo()
+        prompt_usado = system_prompt or self._prompt_geral_efetivo()
 
         def _chamada_sincrona() -> str:
             historico_gemini = [
@@ -371,8 +435,8 @@ class ProvedorDeIA:
                 model=modelo_usado,
                 history=historico_gemini,
                 config=genai_types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    temperature=self._config.temperature,
+                    system_instruction=prompt_usado,
+                    temperature=self._temperatura_efetiva(),
                 ),
             )
             resposta = chat.send_message(nova_mensagem)
@@ -380,18 +444,21 @@ class ProvedorDeIA:
 
         return await asyncio.to_thread(_chamada_sincrona)
 
-    async def _gerar_com_groq(self, historico: list[dict[str, str]], nova_mensagem: str) -> str:
+    async def _gerar_com_groq(
+        self, historico: list[dict[str, str]], nova_mensagem: str, system_prompt: str | None = None
+    ) -> str:
         """Gera resposta usando a API da Groq, como fallback."""
+        prompt_usado = system_prompt or self._prompt_geral_efetivo()
 
         def _chamada_sincrona() -> str:
-            mensagens = [{"role": "system", "content": SYSTEM_PROMPT}]
+            mensagens = [{"role": "system", "content": prompt_usado}]
             mensagens.extend(historico)
             mensagens.append({"role": "user", "content": nova_mensagem})
 
             resposta = self._cliente_groq.chat.completions.create(
-                model=self._config.groq_model_name,
+                model=self._modelo_groq_efetivo(),
                 messages=mensagens,
-                temperature=self._config.temperature,
+                temperature=self._temperatura_efetiva(),
             )
             return resposta.choices[0].message.content.strip()
 

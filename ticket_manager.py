@@ -17,11 +17,13 @@ from typing import TYPE_CHECKING
 
 import discord
 
+import avaliacao
 import emotion
 import logger as log
 import summarizer
 from config import Config
 from database import Database
+from event_bus import bus
 
 if TYPE_CHECKING:
     from ai import ProvedorDeIA
@@ -43,6 +45,8 @@ class Sessao:
     last_activity: str | None = None
     aviso_inatividade_enviado: bool = False
     opened_at: str | None = None
+    modo: str = "ia"
+    helper_id: int | None = None
 
     @classmethod
     def de_linha(cls, linha: dict) -> "Sessao":
@@ -59,6 +63,8 @@ class Sessao:
             last_activity=linha.get("last_activity"),
             aviso_inatividade_enviado=bool(linha.get("aviso_inatividade_enviado", 0)),
             opened_at=linha.get("opened_at"),
+            modo=linha.get("modo") or "ia",
+            helper_id=linha.get("helper_id"),
         )
 
 
@@ -95,6 +101,26 @@ class GerenciadorDeTickets:
     # Criação (impede múltiplas sessões por usuário)
     # ------------------------------------------------------------------
 
+    def session_limit_efetivo(self) -> int:
+        """Limite de sessões abertas, considerando um possível override salvo pelo painel administrativo."""
+        valor = self._db.obter_configuracao("session_limit")
+        if valor is not None:
+            try:
+                return int(valor)
+            except ValueError:
+                pass
+        return self._config.session_limit
+
+    def auto_close_horas_efetivo(self) -> float:
+        """Horas de inatividade até o aviso de encerramento, com possível override do painel administrativo."""
+        valor = self._db.obter_configuracao("auto_close_horas")
+        if valor is not None:
+            try:
+                return float(valor)
+            except ValueError:
+                pass
+        return self._config.auto_close_horas
+
     async def pode_abrir_nova_sessao(self, user_id: int) -> tuple[bool, str]:
         """
         Verifica se um usuário pode abrir uma nova sessão: nega se já
@@ -105,9 +131,10 @@ class GerenciadorDeTickets:
         if existente is not None:
             return False, "Você já possui uma conversa ativa."
 
-        if self._config.session_limit > 0:
+        limite = self.session_limit_efetivo()
+        if limite > 0:
             abertas = await self._db.contar_sessoes_abertas()
-            if abertas >= self._config.session_limit:
+            if abertas >= limite:
                 return False, "No momento não há vagas disponíveis para novas conversas. Tente novamente em instantes."
 
         return True, ""
@@ -157,6 +184,7 @@ class GerenciadorDeTickets:
         session_id = await self._db.criar_sessao(user_id=membro.id, channel_id=canal.id)
         log.ticket_criado(session_id, str(membro), canal.name)
         sessao = Sessao(id=session_id, user_id=membro.id, channel_id=canal.id, status="aberta")
+        await bus.emit("sessao_criada", session_id=session_id, user_id=membro.id, channel_id=canal.id)
         return sessao, canal
 
     # ------------------------------------------------------------------
@@ -194,28 +222,61 @@ class GerenciadorDeTickets:
         await self._db.reabrir_sessao(session_id)
         log.sessao_reaberta(session_id)
 
+    # ------------------------------------------------------------------
+    # Helper humano / Modo Observador / Modo Cooperação (v4.0)
+    # ------------------------------------------------------------------
+
+    async def pausar_ia(self, session_id: int, helper_id: int | None = None) -> None:
+        """
+        Um Helper humano assume a conversa (ou a pausa automática por
+        detecção de crise, sem um Helper específico ainda): a IA para de
+        responder (Modo Observador) e passa a apenas registrar as mensagens.
+        """
+        await self._db.definir_modo_sessao(session_id, "observador", helper_id=helper_id)
+        if helper_id:
+            log.helper_entrou(session_id, helper_id)
+            await bus.emit("helper_entrou", session_id=session_id, helper_id=helper_id)
+
+    async def ativar_cooperacao(self, session_id: int, helper_id: int) -> None:
+        """A IA passa a sugerir respostas apenas para o Helper (Modo Cooperação)."""
+        await self._db.definir_modo_sessao(session_id, "cooperacao", helper_id=helper_id)
+        log.helper_entrou(session_id, helper_id)
+        await bus.emit("helper_entrou", session_id=session_id, helper_id=helper_id)
+
+    async def retomar_ia(self, session_id: int) -> None:
+        """Devolve a conversa para a IA (`/ia continuar`)."""
+        await self._db.definir_modo_sessao(session_id, "ia", helper_id=None)
+        await bus.emit("ia_retomada", session_id=session_id)
+
     async def encerrar_definitivamente(
         self,
         sessao: Sessao,
         canal: discord.abc.GuildChannel,
         ia: "ProvedorDeIA",
         config: Config,
+        client: discord.Client | None = None,
     ) -> None:
         """
         Fluxo completo e único de encerramento de um ticket, usado tanto
         pelo botão "Encerrar Conversa" quanto pelo fechamento automático
         por inatividade: gera o resumo estruturado via IA, classifica a
         emoção predominante da sessão, persiste o fechamento, limpa a
-        memória em RAM e apaga o canal privado.
+        memória em RAM, envia o convite de avaliação por DM (se `client`
+        for informado) e apaga o canal privado.
         """
         mensagens = await self.obter_historico_bruto(sessao.id)
-        resumo = await summarizer.gerar_resumo(ia, mensagens, modelo=config.modelo_resumo)
+        prompt_resumo_customizado = self._db.obter_configuracao("prompt_resumo") or ""
+        resumo = await summarizer.gerar_resumo(
+            ia, mensagens, modelo=config.modelo_resumo, prompt_resumo=prompt_resumo_customizado
+        )
         emocao_predominante = emotion.predominante(
             [m.get("emotion") for m in mensagens if m.get("role") == "user"]
         )
 
         await self.fechar_sessao(sessao.id, resumo.como_dict(), emotion=emocao_predominante)
         log.resumo_criado(sessao.id, config.modelo_resumo)
+        await bus.emit("resumo_criado", session_id=sessao.id, modelo=config.modelo_resumo)
+        await bus.emit("sessao_encerrada", session_id=sessao.id, user_id=sessao.user_id, resumo=resumo.resumo)
 
         if self._memoria is not None:
             self._memoria.limpar_historico(sessao.id)
@@ -228,12 +289,26 @@ class GerenciadorDeTickets:
         except discord.HTTPException as exc:
             log.erro(f"Falha ao enviar mensagem final da sessão #{sessao.id}", exc)
 
+        if client is not None:
+            await self._enviar_avaliacao_por_dm(client, sessao)
+
         await asyncio.sleep(5)
 
         try:
             await canal.delete(reason=f"Ticket #{sessao.id} encerrado")
         except discord.HTTPException as exc:
             log.erro(f"Falha ao apagar o canal da sessão #{sessao.id}", exc)
+
+    async def _enviar_avaliacao_por_dm(self, client: discord.Client, sessao: "Sessao") -> None:
+        """Convida a pessoa a avaliar o atendimento por DM (o canal do ticket já será apagado)."""
+        try:
+            usuario = await client.fetch_user(sessao.user_id)
+            await usuario.send(
+                embed=avaliacao.montar_embed_avaliacao(),
+                view=avaliacao.AvaliacaoView(self._db, sessao.id, sessao.user_id),
+            )
+        except discord.HTTPException as exc:
+            log.aviso(f"Não foi possível enviar o convite de avaliação por DM da sessão #{sessao.id}: {exc}")
 
     async def marcar_aviso_inatividade(self, session_id: int) -> None:
         """Marca que o aviso de inatividade já foi enviado, para não repeti-lo."""
@@ -243,6 +318,7 @@ class GerenciadorDeTickets:
         """Registra que esta sessão teve um episódio de crise detectado."""
         await self._db.marcar_crise(session_id)
         log.crise_detectada(session_id)
+        await bus.emit("crise_detectada", session_id=session_id)
 
     async def sessoes_para_avaliar_fechamento(self) -> list[Sessao]:
         """Retorna todas as sessões abertas, para a rotina de fechamento automático avaliar inatividade."""

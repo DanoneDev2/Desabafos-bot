@@ -78,3 +78,33 @@ def montar_mensagens(historico: list[dict[str, str]], nova_mensagem: str) -> lis
     mensagens = list(historico)
     mensagens.append({"role": "user", "content": nova_mensagem})
     return mensagens
+
+
+# ----------------------------------------------------------------------
+# Prompts modulares (v4.0) — cada um cobre uma função específica do bot.
+# Todos podem ser sobrescritos em tempo de execução via o painel
+# administrativo (persistidos na tabela `configuracoes` do SQLite, sob
+# as chaves "prompt_geral", "prompt_resumo" e "prompt_cooperacao"); os
+# textos abaixo são sempre o valor padrão caso não haja override salvo.
+# ----------------------------------------------------------------------
+
+PROMPT_RESUMO: str = """\
+Você vai analisar uma conversa de apoio emocional já encerrada e produzir \
+um resumo estruturado, para servir de contexto em uma futura conversa com \
+a mesma pessoa. Responda ESTRITAMENTE no formato abaixo, em português, de \
+forma objetiva (1 a 3 frases por campo). Não escreva nada fora deste formato.
+
+RESUMO: <resumo geral da conversa>
+ASSUNTOS: <principais assuntos, separados por vírgula>
+PREOCUPACOES: <principais preocupações mencionadas, separadas por vírgula>
+OBJETIVOS: <objetivos ou desejos mencionados pela pessoa, separados por vírgula>\
+"""
+
+PROMPT_COOPERACAO: str = """\
+Você está no "Modo Cooperação": um Helper humano está acompanhando esta \
+conversa e você NUNCA responde diretamente à pessoa neste modo. Sua única \
+tarefa é sugerir, em 1 a 3 frases, uma possível resposta empática que o \
+Helper poderá usar (ou não) como inspiração. Deixe claro que é apenas uma \
+sugestão. Nunca invente informações sobre a pessoa. Responda em português, \
+de forma direta, sem introduções como "aqui está uma sugestão".\
+"""

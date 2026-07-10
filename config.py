@@ -60,6 +60,9 @@ class Config:
     # Conversa") é publicado. Isso preserva compatibilidade com quem já
     # tinha essa variável configurada.
     staff_role_id: int = field(default_factory=lambda: _get_int("STAFF_ROLE_ID", 0))
+    # Cargo dos Helpers humanos (v4.0): voluntários que podem assumir uma
+    # conversa (Modo Observador/Cooperação). Se vazio, usa STAFF_ROLE_ID.
+    helper_role_id: int = field(default_factory=lambda: _get_int("HELPER_ROLE_ID", 0))
     category_tickets: int = field(default_factory=lambda: _get_int("CATEGORY_TICKETS", 0))
     auto_close_horas: float = field(default_factory=lambda: _get_float("AUTO_CLOSE_HOURS", 48.0))
     auto_close_tolerancia_horas: float = field(
@@ -77,8 +80,8 @@ class Config:
     # IA
     api_key_gemini: str = field(default_factory=lambda: os.getenv("API_KEY_GEMINI", os.getenv("API_KEY_IA", "")))
     api_key_groq: str = field(default_factory=lambda: os.getenv("API_KEY_GROQ", ""))
-    model_name: str = field(default_factory=lambda: os.getenv("MODEL_NAME", "gemini-2.5-flash"))
-    groq_model_name: str = field(default_factory=lambda: os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile"))
+    model_name: str = field(default_factory=lambda: os.getenv("MODEL_NAME", "gemini-1.5-flash"))
+    groq_model_name: str = field(default_factory=lambda: os.getenv("GROQ_MODEL_NAME", "llama-3.1-70b-versatile"))
     temperature: float = field(default_factory=lambda: _get_float("TEMPERATURE", 0.9))
 
     # Memória
@@ -176,6 +179,11 @@ class Config:
     def modelo_resumo(self) -> str:
         """Modelo Gemini usado para gerar resumos de sessão (SUMMARY_MODEL ou, por padrão, MODEL_NAME)."""
         return self.summary_model or self.model_name
+
+    @property
+    def cargos_de_apoio(self) -> tuple[int, ...]:
+        """IDs dos cargos que podem assumir uma conversa como Helper (Staff + Helper, sem duplicar)."""
+        return tuple({cargo for cargo in (self.staff_role_id, self.helper_role_id) if cargo})
 
 
 config = Config()
