@@ -33,7 +33,7 @@ import ui
 import version
 from admin_panel import PainelAdminView, montar_embed_admin
 from ai import ErroDeIA, ProvedorDeIA
-from config import Config
+from config import Config, valor_efetivo_bool, valor_efetivo_int
 from database import Database
 from memory import GerenciadorDeMemoria
 from prompts import PROMPT_COOPERACAO
@@ -83,6 +83,11 @@ class BotDeDesabafos(discord.Client):
     def db(self) -> Database:
         """Acesso à camada de persistência, para módulos que gerenciam sua própria configuração (ex: admin_panel.py)."""
         return self._db
+
+    @property
+    def config(self) -> Config:
+        """Acesso à configuração base (.env), para módulos administrativos que precisam de um valor padrão."""
+        return self._config
 
     # ------------------------------------------------------------------
     # Ciclo de vida
@@ -235,8 +240,8 @@ class BotDeDesabafos(discord.Client):
                 pass
 
     def _eh_membro_de_apoio(self, membro: discord.abc.User) -> bool:
-        """Verifica se um membro possui o cargo de Staff ou de Helper configurado."""
-        cargos_permitidos = self._config.cargos_de_apoio
+        """Verifica se um membro possui algum dos cargos de Staff/Helper configurados (podem ser vários)."""
+        cargos_permitidos = self._config.cargos_de_apoio_efetivo(self._db)
         if not cargos_permitidos or not isinstance(membro, discord.Member):
             return False
         ids_dos_cargos = {cargo.id for cargo in membro.roles}
@@ -262,15 +267,32 @@ class BotDeDesabafos(discord.Client):
 
         # A detecção de crise tem prioridade sobre tudo: mesmo em Modo
         # Observador/Cooperação, uma pessoa em risco recebe a resposta de
-        # segurança imediatamente.
-        resultado_crise = crisis.analisar(conteudo)
-        if resultado_crise.em_crise:
-            await self._tratar_crise(message, sessao, conteudo, emocao)
-            return
+        # segurança imediatamente. Pode ser desativada pelo painel
+        # administrativo (`enable_crisis_mode`) — ativada por padrão.
+        crise_ativa = valor_efetivo_bool(self._db, "enable_crisis_mode", self._config.enable_crisis_mode)
+        if crise_ativa:
+            resultado_crise = crisis.analisar(conteudo)
+            if resultado_crise.em_crise:
+                await self._tratar_crise(message, sessao, conteudo, emocao)
+                return
 
         if sessao.modo == "observador":
             # Um Helper humano está no controle: a IA apenas registra.
             await self._tickets.registrar_mensagem(sessao.id, "user", conteudo, emocao)
+            return
+
+        if not self._ia.ia_ativa():
+            # Interruptor global de IA (Painel MAIN): registra a mensagem,
+            # mas não gera resposta — equivalente a um Modo Observador
+            # "sem Helper específico ainda".
+            await self._tickets.registrar_mensagem(sessao.id, "user", conteudo, emocao)
+            try:
+                await message.channel.send(
+                    "A IA está temporariamente desativada pela administração. Um Helper humano pode assumir "
+                    "esta conversa com `/ia pausar`.",
+                )
+            except discord.HTTPException:
+                pass
             return
 
         if self._cooldown.em_cooldown(usuario_id):
@@ -329,17 +351,20 @@ class BotDeDesabafos(discord.Client):
         segurança fixa, determinística, sempre que houver indícios
         graves de risco à vida na mensagem da pessoa. Também pausa a IA
         automaticamente (Modo Observador), para que um Helper humano
-        precise assumir explicitamente a conversa a partir daqui.
+        precise assumir explicitamente a conversa a partir daqui, e
+        espelha um alerta para o canal de alertas (se configurado), para
+        que a equipe perceba mesmo sem estar dentro do canal do ticket.
         """
         await self._tickets.registrar_mensagem(sessao.id, "user", conteudo, emocao)
         await self._tickets.marcar_crise(sessao.id)
         if sessao.modo == "ia":
             await self._tickets.pausar_ia(sessao.id, helper_id=None)
 
+        cargo_staff = valor_efetivo_int(self._db, "staff_role_id", self._config.staff_role_id)
         resposta = crisis.RESPOSTA_DE_SEGURANCA
-        if self._config.enable_crisis_mode and self._config.staff_role_id:
+        if valor_efetivo_bool(self._db, "enable_crisis_mode", self._config.enable_crisis_mode) and cargo_staff:
             resposta += (
-                f"\n\n_<@&{self._config.staff_role_id}>, um possível sinal de risco foi "
+                f"\n\n_<@&{cargo_staff}>, um possível sinal de risco foi "
                 "identificado nesta conversa e pode merecer atenção da equipe._"
             )
 
@@ -349,6 +374,21 @@ class BotDeDesabafos(discord.Client):
             log.erro("Falha ao enviar a resposta de segurança", exc)
 
         await self._tickets.registrar_mensagem(sessao.id, "assistant", crisis.RESPOSTA_DE_SEGURANCA, None)
+        await self._espelhar_alerta_de_crise(sessao, message.channel)
+
+    async def _espelhar_alerta_de_crise(self, sessao, canal_ticket: discord.abc.GuildChannel) -> None:
+        """Envia uma cópia curta do alerta de crise para o canal de alertas configurado, se houver."""
+        canal_id = self._config.canal_efetivo(self._db, "canal_alertas", self._config.canal_alertas)
+        if not canal_id:
+            return
+        canal_alertas = self.get_channel(canal_id)
+        if canal_alertas is None:
+            return
+        try:
+            nome_canal = getattr(canal_ticket, "mention", str(canal_ticket))
+            await canal_alertas.send(f"🚨 Possível sinal de risco detectado em {nome_canal} (sessão #{sessao.id}).")
+        except discord.HTTPException as exc:
+            log.erro("Falha ao espelhar alerta de crise no canal de alertas", exc)
 
     # ------------------------------------------------------------------
     # Conversa normal (IA)
@@ -651,21 +691,81 @@ class BotDeDesabafos(discord.Client):
             ephemeral=True,
         )
 
-    async def _comando_health(self, interaction: discord.Interaction) -> None:
-        """Implementação do comando /health."""
+    async def _coletar_metricas(self) -> dict:
+        """
+        Reúne todas as métricas usadas tanto pelo `/health` quanto pelo
+        Dashboard do Painel MAIN — extraído para um único lugar, em vez
+        de duplicar as mesmas consultas nos dois pontos (regra do projeto:
+        evitar código duplicado).
+        """
         db_ok = await self._db.esta_saudavel()
         status_provedores = self._ia.status_provedores()
-        uptime_formatado = _formatar_duracao(int(time.monotonic() - self._inicio_bot))
-
         abertas = await self._db.contar_sessoes_abertas()
         fechadas = await self._db.contar_sessoes_fechadas()
         estatisticas = await self._db.obter_estatisticas_completas()
         backup_info = await self._db.ultimo_backup_info()
         media_avaliacoes, total_avaliacoes = await self._db.obter_media_avaliacoes()
+        por_modo = await self._tickets.estatisticas_do_dashboard()
+
+        return {
+            "db_ok": db_ok,
+            "status_provedores": status_provedores,
+            "abertas": abertas,
+            "fechadas": fechadas,
+            "estatisticas": estatisticas,
+            "backup_info": backup_info,
+            "media_avaliacoes": media_avaliacoes,
+            "total_avaliacoes": total_avaliacoes,
+            "uptime_formatado": _formatar_duracao(int(time.monotonic() - self._inicio_bot)),
+            **por_modo,
+        }
+
+    async def montar_embed_dashboard(self) -> discord.Embed:
+        """
+        Dashboard do Painel MAIN: uma "foto" do estado atual do bot sob
+        demanda (clique no botão para atualizar). Não é uma tela que se
+        atualiza sozinha em tempo real — isso exigiria um loop de edição
+        contínua da mensagem, deixado para uma fase futura (ver README).
+        """
+        m = await self._coletar_metricas()
+
+        embed = discord.Embed(title="📊 Dashboard — LORA", color=discord.Color.dark_gold())
+        embed.add_field(name="Sessões abertas", value=str(m["abertas"]), inline=True)
+        embed.add_field(name="Sessões encerradas", value=str(m["fechadas"]), inline=True)
+        embed.add_field(name="Em Modo IA", value=str(m["sessoes_em_ia"]), inline=True)
+        embed.add_field(name="Em Modo Observador", value=str(m["sessoes_em_observador"]), inline=True)
+        embed.add_field(name="Em Modo Cooperação", value=str(m["sessoes_em_cooperacao"]), inline=True)
+        embed.add_field(name="Em crise (abertas)", value=str(m["sessoes_em_crise"]), inline=True)
+        embed.add_field(name="Fila da IA", value=f"{self._ia.tamanho_fila()} na espera", inline=True)
+        embed.add_field(
+            name="Tempo médio de resposta",
+            value=f"{self._tempo_medio_resposta_ms():.0f}ms" if self._contagem_respostas else "sem dados ainda",
+            inline=True,
+        )
+        embed.add_field(name="Modelo Gemini ativo", value=self._ia.modelo_gemini_atual(), inline=True)
+        embed.add_field(name="Modelo Groq ativo", value=self._ia.modelo_groq_atual(), inline=True)
+        embed.add_field(name="IA ativa?", value="🟢 sim" if self._ia.ia_ativa() else "🔴 não (pausada globalmente)", inline=True)
+        embed.add_field(name="Uso de memória", value=f"{uso_memoria_mb():.1f} MB", inline=True)
+        embed.add_field(name="Uptime", value=m["uptime_formatado"], inline=True)
+        embed.add_field(name="Cargos de apoio configurados", value=str(len(self._config.cargos_de_apoio_efetivo(self._db))), inline=True)
+        embed.add_field(
+            name="Avaliação média",
+            value=f"⭐ {m['media_avaliacoes']:.1f} ({m['total_avaliacoes']})" if m["total_avaliacoes"] else "sem avaliações",
+            inline=True,
+        )
+        embed.set_footer(
+            text="'Helpers/Staff online' exigiria o Members Intent (dado sensível de presença) — fora de escopo por ora."
+        )
+        return embed
+
+    async def _comando_health(self, interaction: discord.Interaction) -> None:
+        """Implementação do comando /health."""
+        m = await self._coletar_metricas()
+        status_provedores = m["status_provedores"]
 
         embed = discord.Embed(title="🌙 Status do LORA", color=discord.Color.blurple())
         embed.add_field(name="Discord", value=f"🟢 Conectado ({self.latency * 1000:.0f}ms)", inline=True)
-        embed.add_field(name="SQLite", value="🟢 Saudável" if db_ok else "🔴 Com problemas", inline=True)
+        embed.add_field(name="SQLite", value="🟢 Saudável" if m["db_ok"] else "🔴 Com problemas", inline=True)
         embed.add_field(name="Fila de IA", value=f"{self._ia.tamanho_fila()} na espera", inline=True)
 
         if "gemini" in status_provedores:
@@ -683,22 +783,22 @@ class BotDeDesabafos(discord.Client):
                 inline=True,
             )
 
-        embed.add_field(name="Tickets ativos", value=str(abertas), inline=True)
-        embed.add_field(name="Sessões encerradas", value=str(fechadas), inline=True)
-        embed.add_field(name="Fallbacks (total)", value=str(estatisticas.get("respostas_fallback", 0)), inline=True)
-        embed.add_field(name="Crises detectadas", value=str(estatisticas.get("crises_detectadas", 0)), inline=True)
-        embed.add_field(name="Uptime", value=uptime_formatado, inline=True)
+        embed.add_field(name="Tickets ativos", value=str(m["abertas"]), inline=True)
+        embed.add_field(name="Sessões encerradas", value=str(m["fechadas"]), inline=True)
+        embed.add_field(name="Fallbacks (total)", value=str(m["estatisticas"].get("respostas_fallback", 0)), inline=True)
+        embed.add_field(name="Crises detectadas", value=str(m["estatisticas"].get("crises_detectadas", 0)), inline=True)
+        embed.add_field(name="Uptime", value=m["uptime_formatado"], inline=True)
         embed.add_field(
             name="Tempo médio de resposta",
             value=f"{self._tempo_medio_resposta_ms():.0f}ms" if self._contagem_respostas else "sem dados ainda",
             inline=True,
         )
         embed.add_field(name="Uso de memória", value=f"{uso_memoria_mb():.1f} MB", inline=True)
-        embed.add_field(name="Último backup", value=backup_info or "nenhum ainda", inline=True)
+        embed.add_field(name="Último backup", value=m["backup_info"] or "nenhum ainda", inline=True)
         embed.add_field(name="Watchdog", value="🟢 Ativo", inline=True)
         embed.add_field(
             name="Avaliação média",
-            value=f"⭐ {media_avaliacoes:.1f} ({total_avaliacoes} avaliações)" if total_avaliacoes else "sem avaliações ainda",
+            value=f"⭐ {m['media_avaliacoes']:.1f} ({m['total_avaliacoes']} avaliações)" if m["total_avaliacoes"] else "sem avaliações ainda",
             inline=True,
         )
 

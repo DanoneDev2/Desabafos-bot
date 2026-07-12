@@ -44,7 +44,7 @@ from google.genai import types as genai_types
 from groq import Groq
 
 import logger as log
-from config import Config
+from config import Config, valor_efetivo, valor_efetivo_bool, valor_efetivo_float
 from memory import GerenciadorDeMemoria
 from prompts import SYSTEM_PROMPT
 from utils import calcular_backoff, eh_erro_contexto_muito_grande, eh_erro_retentavel
@@ -156,32 +156,33 @@ class ProvedorDeIA:
         self._worker_iniciado = False
 
     # ------------------------------------------------------------------
-    # Configuração dinâmica (painel administrativo, v4.0) — sempre com
-    # fallback seguro para config.py/prompts.py caso nada esteja salvo.
+    # Configuração dinâmica (painel administrativo, v4.0+) — sempre com
+    # fallback seguro para config.py caso nada esteja salvo. Reaproveita
+    # os resolvedores genéricos de config.py em vez de duplicar a lógica
+    # de conversão/fallback aqui.
     # ------------------------------------------------------------------
 
-    def _config_efetiva(self, chave: str, padrao: str) -> str:
-        if self._db is not None:
-            valor = self._db.obter_configuracao(chave)
-            if valor:
-                return valor
-        return padrao
-
     def _temperatura_efetiva(self) -> float:
-        bruta = self._config_efetiva("ia_temperature", str(self._config.temperature))
-        try:
-            return float(bruta)
-        except ValueError:
-            return self._config.temperature
+        return valor_efetivo_float(self._db, "ia_temperature", self._config.temperature)
 
     def _prompt_geral_efetivo(self) -> str:
-        return self._config_efetiva("prompt_geral", SYSTEM_PROMPT)
+        """
+        Prompt geral da IA. Diferente de temperatura/modelo, este NUNCA é
+        lido do banco/painel administrativo — os prompts internos da LORA
+        ficam exclusivamente nos arquivos Python (`prompts.py`), por regra
+        explícita do projeto.
+        """
+        return SYSTEM_PROMPT
 
     def _modelo_gemini_padrao_efetivo(self) -> str:
-        return self._config_efetiva("ia_model_gemini", self._config.model_name)
+        return valor_efetivo(self._db, "ia_model_gemini", self._config.model_name)
 
     def _modelo_groq_efetivo(self) -> str:
-        return self._config_efetiva("ia_model_groq", self._config.groq_model_name)
+        return valor_efetivo(self._db, "ia_model_groq", self._config.groq_model_name)
+
+    def ia_ativa(self) -> bool:
+        """Interruptor global de IA (painel administrativo): se False, a IA não deve ser chamada."""
+        return valor_efetivo_bool(self._db, "ia_ativa", True)
 
     # ------------------------------------------------------------------
     # Interface pública (compatível com a versão anterior)

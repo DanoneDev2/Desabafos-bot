@@ -170,6 +170,93 @@ interface pública — só estendido.
 
 ---
 
+## Novidades da v4.x (Fase 2) — Painel MAIN expandido
+
+Esta rodada pediu, de novo, um painel administrativo quase total (dashboard
+completo, todos os canais/cargos configuráveis, sistema de música,
+transcripts em HTML, etc.) — outra vez, mais do que cabe com qualidade
+numa única entrega. Segui dividindo em fases, com uma correção importante
+primeiro:
+
+**Correção em relação à Fase 1:** a Fase 1 tinha um campo de "prompt
+geral" no `/painel admin`. Esta atualização deixou explícito que
+**prompts nunca devem aparecer no painel** — removi esse campo e a
+leitura de prompts a partir do banco em qualquer lugar do projeto.
+`SYSTEM_PROMPT`, `PROMPT_RESUMO` e `PROMPT_COOPERACAO` agora só existem
+em `prompts.py`, como deveria ser desde o início.
+
+**O que esta Fase 2 entrega, de verdade, testado e funcionando:**
+
+- **Painel MAIN com 5 seções** (`/painel admin`): 📊 Dashboard, 🤖 IA
+  (+ interruptor liga/desliga), 🎫 Tickets (+ escolha entre threads
+  privadas ou canais tradicionais), 📺 Canais (transcripts, logs,
+  alertas, crise grave, chamada de Helpers) e 👥 Cargos (Staff,
+  **múltiplos** Helpers, Supervisor) — tudo com efeito imediato.
+- **Dashboard sob demanda**: sessões abertas/encerradas, por modo (IA/
+  Observador/Cooperação), em crise, fila da IA, tempo médio de resposta,
+  modelos ativos, uso de memória, uptime, avaliação média. *Não é uma
+  tela que se atualiza sozinha em tempo real* — é uma "foto" atualizada
+  a cada clique no botão (ver "fora de escopo" abaixo para o porquê).
+- **Múltiplos cargos Helper simultâneos**: `HELPER 1`, `HELPER 2`,
+  `HELPER 3`... todos funcionam ao mesmo tempo, tanto para assumir
+  tickets quanto para ganhar acesso automático ao canal.
+- **Rastreamento de quem/quando assumiu**: `helper_desde` e `pausado_em`
+  são registrados automaticamente sempre que uma sessão sai do Modo IA
+  — é a base de tempo usada pela escalada automática abaixo.
+- **Escalada automática de crise**: se uma sessão em crise ficar mais
+  que `CRISE_TEMPO_MAXIMO_ESPERA_HELPER_MINUTOS` sem um Helper assumir,
+  o bot escala automaticamente para `CANAL_CRISE_GRAVE`, mencionando o
+  cargo de Supervisor — uma única vez por sessão.
+- **Espelhamento de alertas de crise**: além da resposta de segurança já
+  enviada no próprio ticket, uma cópia curta do alerta vai para
+  `CANAL_ALERTAS` (se configurado), para quem não está dentro do ticket.
+- **Interruptor global de IA**: `/painel admin` → IA → "IA ativa? não"
+  pausa a geração de respostas em todo o bot (equivalente a um Modo
+  Observador global) sem precisar reiniciar nada.
+- **Estatísticas por período**: nova tabela `estatisticas_diarias`
+  permite consultar hoje/semana/mês/total (`obter_estatisticas_por_período`
+  em `database.py`) — a base para futuros comandos de relatório.
+- **Categorias de log formalizadas**: `[ia]`, `[discord]`, `[crise]`,
+  `[ticket]`, `[helper]`, `[painel]`, `[administracao]` já prefixam os
+  eventos relevantes no log, permitindo filtrar por categoria
+  (`grep '\[crise\]' dados/logs/bot.log`) sem precisar de arquivos
+  separados por categoria (ver "fora de escopo").
+- **Zero duplicação nova**: toda a resolução "painel administrativo
+  substitui `.env`" passou a usar as mesmas quatro funções utilitárias
+  (`valor_efetivo*` em `config.py`) em `ai.py`, `ticket_manager.py` e
+  `events.py`, em vez de cada módulo reimplementar o próprio
+  try/except de conversão — inclusive o código da Fase 1 foi retrofitado.
+
+**Deliberadamente fora desta fase** (mesmo raciocínio de honestidade da
+Fase 1 — poucas coisas completas em vez de muitas pela metade):
+
+- **Edição de todos os embeds campo a campo** (thumbnail, imagem, botões,
+  emoji customizado): o painel já cobre os textos/valores que mais mudam
+  no dia a dia; um editor de embed genérico é um recurso de UI grande o
+  bastante para merecer sua própria fase.
+- **Sistema de música/playlists**: precisa de armazenamento e gestão de
+  arquivos de áudio, que o projeto ainda não tem — construir isso às
+  pressas junto de tudo o resto arriscaria fazer mal feito.
+- **Transcripts em HTML**: o `CANAL_TRANSCRIPTS` já pode ser configurado
+  pelo painel, mas a geração do HTML em si (tema, gráficos, layout
+  responsivo) ainda não existe — reaproveitará o resumo/histórico já
+  salvos quando for implementado.
+- **Dashboard em tempo real** (auto-atualização): o botão atual sempre
+  mostra o estado mais recente sob demanda; uma versão que se atualiza
+  sozinha exigiria um loop de edição contínua da mensagem — barato de
+  descrever, fácil de errar (rate limit do Discord) se apressado.
+- **"Helpers/Staff online"**: exigiria o *Members Intent* (um intent
+  privilegiado, ligado a presença/status de membros) — decidi não pedir
+  esse acesso adicional sem uma necessidade clara e specificamente
+  aprovada, já que é um dado sensível. O Dashboard mostra a quantidade
+  de cargos de apoio configurados como alternativa.
+- **Seleção automática de qual Helper assumirá** e **arquivos de log
+  físicos separados por categoria**: o Event Bus e as tags `[categoria]`
+  já são a base para isso; a automação/arquivos em si ficam para quando
+  houver Helpers reais o bastante para justificar a complexidade.
+
+---
+
 ## Índice
 
 1. [Estrutura do projeto](#estrutura-do-projeto)

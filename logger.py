@@ -4,6 +4,15 @@ logger.py
 Sistema de logs coloridos para o terminal, usando apenas a biblioteca
 padrão (sem dependências extras). Fornece funções semânticas para os
 principais eventos do bot.
+
+CATEGORIAS (v4.x) — cada evento relevante é logado com um prefixo entre
+colchetes, permitindo filtrar por categoria (`grep '\\[crise\\]'
+dados/logs/bot.log`, por exemplo) sem precisar de arquivos de log
+separados por categoria (deliberadamente fora de escopo por ora — ver
+README): [ia], [discord], [crise], [ticket], [helper], [painel],
+[administracao]. Uma futura fase pode trocar isso por arquivos físicos
+separados sem alterar a interface pública deste módulo (todas as
+chamadas continuam `log.<funcao>(...)`).
 """
 
 from __future__ import annotations
@@ -168,3 +177,19 @@ def resumo_criado(session_id: int, modelo: str) -> None:
 
 def crise_detectada(session_id: int) -> None:
     log.warning(f"[crise] Indícios de crise detectados na sessão #{session_id}.")
+
+
+def crise_escalada(session_id: int) -> None:
+    log.warning(f"[crise] Escalada automática enviada para a sessão #{session_id} (Helper não assumiu a tempo).")
+
+
+def helper_entrou(session_id: int, helper_id: int) -> None:
+    log.warning(f"[helper] Helper {helper_id} assumiu a sessão #{session_id} — IA pausada.")
+
+
+def painel_enviado(tipo: str, canal: str) -> None:
+    log.info(f"[painel] Painel '{tipo}' publicado em '#{canal}' por comando administrativo.")
+
+
+def configuracao_alterada(chave: str, quem: str) -> None:
+    log.info(f"[administracao] Configuração '{chave}' alterada por {quem} via Painel MAIN.")

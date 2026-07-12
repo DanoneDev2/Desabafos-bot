@@ -23,11 +23,11 @@ import asyncio
 import os
 import shutil
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import logger as log
 
-VERSAO_SCHEMA_ATUAL = 3
+VERSAO_SCHEMA_ATUAL = 4
 
 # Definição das tabelas geridas pela migração automática.
 _TABELAS: dict[str, str] = {
@@ -105,6 +105,15 @@ _TABELAS: dict[str, str] = {
             criado_em TEXT NOT NULL
         )
     """,
+    # --- Estatísticas com recorte por data (v4.x) --------------------------
+    "estatisticas_diarias": """
+        CREATE TABLE IF NOT EXISTS estatisticas_diarias (
+            data TEXT NOT NULL,
+            chave TEXT NOT NULL,
+            valor INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (data, chave)
+        )
+    """,
 }
 
 # Colunas esperadas por tabela — usado pela migração para ADICIONAR
@@ -121,6 +130,9 @@ _COLUNAS_ESPERADAS: dict[str, dict[str, str]] = {
         "crise_detectada": "INTEGER NOT NULL DEFAULT 0",
         "modo": "TEXT NOT NULL DEFAULT 'ia'",
         "helper_id": "INTEGER",
+        "helper_desde": "TEXT",
+        "pausado_em": "TEXT",
+        "escalada_enviada": "INTEGER NOT NULL DEFAULT 0",
     },
     "messages": {
         "emotion": "TEXT",
@@ -292,7 +304,8 @@ class Database:
     # ------------------------------------------------------------------
 
     async def incrementar_estatistica(self, chave: str, incremento: int = 1) -> None:
-        """Incrementa (ou cria) um contador de estatística persistente."""
+        """Incrementa (ou cria) um contador de estatística persistente (total) e o de hoje."""
+        hoje = _hoje_iso()
 
         def _sync() -> None:
             assert self._conexao is not None
@@ -303,9 +316,36 @@ class Database:
                 """,
                 (chave, incremento),
             )
+            self._conexao.execute(
+                """
+                INSERT INTO estatisticas_diarias (data, chave, valor) VALUES (?, ?, ?)
+                ON CONFLICT(data, chave) DO UPDATE SET valor = valor + excluded.valor
+                """,
+                (hoje, chave, incremento),
+            )
             self._conexao.commit()
 
         await asyncio.to_thread(_sync)
+
+    async def obter_estatisticas_por_periodo(self, dias: int) -> dict[str, int]:
+        """
+        Soma as estatísticas diárias dos últimos `dias` dias (ex: 1 para
+        "hoje", 7 para "semana", 30 para "mês"). Usa `estatisticas_diarias`,
+        que só existe a partir da v4.x — sessões/eventos anteriores a essa
+        atualização não aparecem aqui (mas continuam no total via
+        `obter_estatisticas_completas`).
+        """
+        data_limite = (datetime.now(timezone.utc) - timedelta(days=dias)).date().isoformat()
+
+        def _sync() -> dict[str, int]:
+            assert self._conexao is not None
+            linhas = self._conexao.execute(
+                "SELECT chave, SUM(valor) AS total FROM estatisticas_diarias WHERE data >= ? GROUP BY chave",
+                (data_limite,),
+            ).fetchall()
+            return {linha["chave"]: int(linha["total"]) for linha in linhas}
+
+        return await asyncio.to_thread(_sync)
 
     async def registrar_usuario_visto(self, usuario_id: int) -> None:
         """Registra (ou atualiza) que um usuário único interagiu com o bot."""
@@ -575,21 +615,101 @@ class Database:
     async def definir_modo_sessao(self, session_id: int, modo: str, helper_id: int | None = None) -> None:
         """
         Define o modo de atendimento da sessão: 'ia' (padrão), 'observador'
-        (a IA para de responder enquanto um Helper humano assume) ou
-        'cooperacao' (a IA sugere respostas apenas para o Helper ver).
+        (a IA para de responder enquanto um Helper humano assume, ou uma
+        crise foi detectada e ainda aguarda um Helper) ou 'cooperacao' (a
+        IA sugere respostas apenas para o Helper ver).
+
+        Também registra `pausado_em` (quando a sessão saiu do modo IA —
+        usado pela escalada automática de crise) e `helper_desde` (quando
+        um Helper específico efetivamente assumiu), e limpa
+        `escalada_enviada` ao devolver para a IA.
         """
         if modo not in ("ia", "observador", "cooperacao"):
             raise ValueError(f"Modo de sessão inválido: {modo}")
 
+        agora = _agora_iso()
+        pausado_em = agora if modo != "ia" else None
+        helper_desde = agora if (modo != "ia" and helper_id) else None
+        limpar_escalada = modo == "ia"
+
         def _sync() -> None:
             assert self._conexao is not None
-            self._conexao.execute(
-                "UPDATE sessions SET modo = ?, helper_id = ? WHERE id = ?",
-                (modo, helper_id, session_id),
-            )
+            if limpar_escalada:
+                self._conexao.execute(
+                    "UPDATE sessions SET modo = ?, helper_id = ?, pausado_em = ?, helper_desde = ?, "
+                    "escalada_enviada = 0 WHERE id = ?",
+                    (modo, helper_id, pausado_em, helper_desde, session_id),
+                )
+            else:
+                self._conexao.execute(
+                    "UPDATE sessions SET modo = ?, helper_id = ?, "
+                    "pausado_em = COALESCE(pausado_em, ?), helper_desde = COALESCE(?, helper_desde) WHERE id = ?",
+                    (modo, helper_id, pausado_em, helper_desde, session_id),
+                )
             self._conexao.commit()
 
         await asyncio.to_thread(_sync)
+
+    async def marcar_escalada_enviada(self, session_id: int) -> None:
+        """Marca que a escalada automática de crise já foi enviada para esta sessão (evita reenvio)."""
+
+        def _sync() -> None:
+            assert self._conexao is not None
+            self._conexao.execute("UPDATE sessions SET escalada_enviada = 1 WHERE id = ?", (session_id,))
+            self._conexao.commit()
+
+        await asyncio.to_thread(_sync)
+
+    async def contar_sessoes_por_modo(self) -> dict[str, int]:
+        """Retorna quantas sessões abertas existem em cada modo ('ia', 'observador', 'cooperacao') — dashboard."""
+
+        def _sync() -> dict[str, int]:
+            assert self._conexao is not None
+            linhas = self._conexao.execute(
+                "SELECT modo, COUNT(*) AS total FROM sessions WHERE status = 'aberta' GROUP BY modo"
+            ).fetchall()
+            return {linha["modo"]: int(linha["total"]) for linha in linhas}
+
+        return await asyncio.to_thread(_sync)
+
+    async def contar_sessoes_em_crise_abertas(self) -> int:
+        """Quantas sessões abertas têm `crise_detectada` marcado — dashboard."""
+
+        def _sync() -> int:
+            assert self._conexao is not None
+            row = self._conexao.execute(
+                "SELECT COUNT(*) AS total FROM sessions WHERE status = 'aberta' AND crise_detectada = 1"
+            ).fetchone()
+            return int(row["total"])
+
+        return await asyncio.to_thread(_sync)
+
+    async def sessoes_aguardando_escalada(self, minutos: int) -> list[dict]:
+        """
+        Sessões em crise, pausadas (Modo Observador), sem Helper efetivo
+        ainda (`helper_id` nulo/0) há mais de `minutos` minutos, e que
+        ainda não foram escaladas — usadas pela escalada automática.
+        """
+        limite = (datetime.now(timezone.utc) - timedelta(minutes=minutos)).isoformat()
+
+        def _sync() -> list[dict]:
+            assert self._conexao is not None
+            linhas = self._conexao.execute(
+                """
+                SELECT * FROM sessions
+                WHERE status = 'aberta'
+                  AND crise_detectada = 1
+                  AND modo = 'observador'
+                  AND (helper_id IS NULL OR helper_id = 0)
+                  AND escalada_enviada = 0
+                  AND pausado_em IS NOT NULL
+                  AND pausado_em <= ?
+                """,
+                (limite,),
+            ).fetchall()
+            return [dict(linha) for linha in linhas]
+
+        return await asyncio.to_thread(_sync)
 
     async def salvar_avaliacao(
         self, session_id: int, user_id: int, estrelas: int, comentario: str | None = None
@@ -668,3 +788,8 @@ class Database:
 def _agora_iso() -> str:
     """Retorna o timestamp atual em ISO 8601 (UTC)."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _hoje_iso() -> str:
+    """Retorna a data atual (sem hora), em ISO 8601 (UTC) — usado nas estatísticas diárias."""
+    return datetime.now(timezone.utc).date().isoformat()

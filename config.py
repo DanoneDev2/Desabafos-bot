@@ -77,6 +77,24 @@ class Config:
     enable_streaming: bool = field(default_factory=lambda: _get_bool("ENABLE_STREAMING", False))
     enable_private_threads: bool = field(default_factory=lambda: _get_bool("ENABLE_PRIVATE_THREADS", False))
 
+    # Cargos adicionais e canais dedicados (v4.x) — todos com override
+    # possível pelo Painel MAIN (ver valor_efetivo* abaixo); os valores
+    # aqui são apenas o padrão vindo do .env.
+    supervisor_role_id: int = field(default_factory=lambda: _get_int("SUPERVISOR_ROLE_ID", 0))
+    admin_role_id: int = field(default_factory=lambda: _get_int("ADMIN_ROLE_ID", 0))
+    canal_transcripts: int = field(default_factory=lambda: _get_int("CANAL_TRANSCRIPTS", 0))
+    canal_logs: int = field(default_factory=lambda: _get_int("CANAL_LOGS", 0))
+    canal_alertas: int = field(default_factory=lambda: _get_int("CANAL_ALERTAS", 0))
+    canal_admin: int = field(default_factory=lambda: _get_int("CANAL_ADMIN", 0))
+    canal_crise_grave: int = field(default_factory=lambda: _get_int("CANAL_CRISE_GRAVE", 0))
+    canal_chamada_helpers: int = field(default_factory=lambda: _get_int("CANAL_CHAMADA_HELPERS", 0))
+
+    # Escalada de crise (v4.x)
+    crise_tempo_maximo_espera_helper_minutos: int = field(
+        default_factory=lambda: _get_int("CRISE_TEMPO_MAXIMO_ESPERA_HELPER_MINUTOS", 15)
+    )
+    crise_escalada_automatica: bool = field(default_factory=lambda: _get_bool("CRISE_ESCALADA_AUTOMATICA", True))
+
     # IA
     api_key_gemini: str = field(default_factory=lambda: os.getenv("API_KEY_GEMINI", os.getenv("API_KEY_IA", "")))
     api_key_groq: str = field(default_factory=lambda: os.getenv("API_KEY_GROQ", ""))
@@ -185,5 +203,76 @@ class Config:
         """IDs dos cargos que podem assumir uma conversa como Helper (Staff + Helper, sem duplicar)."""
         return tuple({cargo for cargo in (self.staff_role_id, self.helper_role_id) if cargo})
 
+    def cargos_de_apoio_efetivo(self, db=None) -> tuple[int, ...]:
+        """
+        IDs dos cargos de apoio (Staff + Helper(s)), considerando um
+        possível override do painel administrativo (múltiplos cargos
+        Helper, separados por vírgula, sob a chave `cargos_apoio_ids`).
+        """
+        return lista_efetiva_ids(db, "cargos_apoio_ids", self.cargos_de_apoio)
+
+    def canal_efetivo(self, db, chave: str, padrao: int) -> int:
+        """Resolve o ID de um canal configurável (transcripts, logs, alertas, crise, etc.)."""
+        return valor_efetivo_int(db, chave, padrao)
+
 
 config = Config()
+
+
+# ----------------------------------------------------------------------
+# Resolução de "configuração efetiva" (v4.x) — um valor salvo pelo painel
+# administrativo (tabela `configuracoes` do SQLite) sempre tem prioridade
+# sobre o `.env`; se nada tiver sido salvo, o `.env` continua valendo.
+#
+# Centralizado aqui para todo módulo (ai.py, ticket_manager.py, events.py)
+# reaproveitar a MESMA lógica em vez de reimplementar o padrão
+# "tenta converter, se falhar cai no padrão" em cada lugar (regra do
+# projeto: evitar código duplicado). `db` é sempre um objeto com o
+# método síncrono `obter_configuracao(chave) -> str | None` (a classe
+# `Database`); passar `None` sempre retorna o padrão.
+# ----------------------------------------------------------------------
+
+
+def valor_efetivo(db, chave: str, padrao: str) -> str:
+    """Resolve um valor de configuração como texto (painel administrativo > padrão)."""
+    if db is None:
+        return padrao
+    bruto = db.obter_configuracao(chave)
+    return bruto if bruto not in (None, "") else padrao
+
+
+def valor_efetivo_int(db, chave: str, padrao: int) -> int:
+    """Resolve um valor de configuração como inteiro, com fallback seguro para o padrão."""
+    bruto = valor_efetivo(db, chave, str(padrao))
+    try:
+        return int(bruto)
+    except (TypeError, ValueError):
+        return padrao
+
+
+def valor_efetivo_float(db, chave: str, padrao: float) -> float:
+    """Resolve um valor de configuração como float, com fallback seguro para o padrão."""
+    bruto = valor_efetivo(db, chave, str(padrao))
+    try:
+        return float(bruto)
+    except (TypeError, ValueError):
+        return padrao
+
+
+def valor_efetivo_bool(db, chave: str, padrao: bool) -> bool:
+    """Resolve um valor de configuração como booleano ('sim'/'true'/'1' contam como verdadeiro)."""
+    bruto = valor_efetivo(db, chave, "true" if padrao else "false")
+    return str(bruto).strip().lower() in ("true", "sim", "1", "yes")
+
+
+def lista_efetiva_ids(db, chave: str, padrao: tuple[int, ...]) -> tuple[int, ...]:
+    """Resolve uma lista de IDs (cargos, canais) separada por vírgula, com fallback para o padrão."""
+    bruto = valor_efetivo(db, chave, "")
+    if not bruto:
+        return padrao
+    ids: list[int] = []
+    for pedaco in bruto.split(","):
+        pedaco = pedaco.strip()
+        if pedaco.isdigit():
+            ids.append(int(pedaco))
+    return tuple(ids) if ids else padrao

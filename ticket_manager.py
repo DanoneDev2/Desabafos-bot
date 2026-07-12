@@ -21,7 +21,7 @@ import avaliacao
 import emotion
 import logger as log
 import summarizer
-from config import Config
+from config import Config, valor_efetivo_bool, valor_efetivo_float, valor_efetivo_int
 from database import Database
 from event_bus import bus
 
@@ -47,6 +47,9 @@ class Sessao:
     opened_at: str | None = None
     modo: str = "ia"
     helper_id: int | None = None
+    helper_desde: str | None = None
+    pausado_em: str | None = None
+    escalada_enviada: bool = False
 
     @classmethod
     def de_linha(cls, linha: dict) -> "Sessao":
@@ -65,6 +68,9 @@ class Sessao:
             opened_at=linha.get("opened_at"),
             modo=linha.get("modo") or "ia",
             helper_id=linha.get("helper_id"),
+            helper_desde=linha.get("helper_desde"),
+            pausado_em=linha.get("pausado_em"),
+            escalada_enviada=bool(linha.get("escalada_enviada", 0)),
         )
 
 
@@ -103,23 +109,11 @@ class GerenciadorDeTickets:
 
     def session_limit_efetivo(self) -> int:
         """Limite de sessões abertas, considerando um possível override salvo pelo painel administrativo."""
-        valor = self._db.obter_configuracao("session_limit")
-        if valor is not None:
-            try:
-                return int(valor)
-            except ValueError:
-                pass
-        return self._config.session_limit
+        return valor_efetivo_int(self._db, "session_limit", self._config.session_limit)
 
     def auto_close_horas_efetivo(self) -> float:
         """Horas de inatividade até o aviso de encerramento, com possível override do painel administrativo."""
-        valor = self._db.obter_configuracao("auto_close_horas")
-        if valor is not None:
-            try:
-                return float(valor)
-            except ValueError:
-                pass
-        return self._config.auto_close_horas
+        return valor_efetivo_float(self._db, "auto_close_horas", self._config.auto_close_horas)
 
     async def pode_abrir_nova_sessao(self, user_id: int) -> tuple[bool, str]:
         """
@@ -145,7 +139,8 @@ class GerenciadorDeTickets:
         """Cria o canal (ou thread privada) do ticket, com as permissões corretas."""
         nome = _nome_de_canal(getattr(membro, "display_name", str(membro)))
 
-        if self._config.enable_private_threads:
+        usar_threads = valor_efetivo_bool(self._db, "enable_private_threads", self._config.enable_private_threads)
+        if usar_threads:
             canal_ancora = guild.get_channel(self._config.canal_painel)
             if canal_ancora is None:
                 raise RuntimeError(
@@ -166,10 +161,10 @@ class GerenciadorDeTickets:
             overwrites[guild.me] = discord.PermissionOverwrite(
                 view_channel=True, send_messages=True, manage_channels=True
             )
-        if self._config.staff_role_id:
-            staff_role = guild.get_role(self._config.staff_role_id)
-            if staff_role is not None:
-                overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+        for cargo_id in self._config.cargos_de_apoio_efetivo(self._db):
+            cargo = guild.get_role(cargo_id)
+            if cargo is not None:
+                overwrites[cargo] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
 
         canal = await guild.create_text_channel(
             name=nome, category=categoria, overwrites=overwrites, reason=f"Ticket de {membro}"
@@ -248,6 +243,40 @@ class GerenciadorDeTickets:
         await self._db.definir_modo_sessao(session_id, "ia", helper_id=None)
         await bus.emit("ia_retomada", session_id=session_id)
 
+    # ------------------------------------------------------------------
+    # Escalada automática de crise e dashboard (v4.x)
+    # ------------------------------------------------------------------
+
+    def crise_tempo_maximo_espera_efetivo(self) -> int:
+        """Minutos de espera por um Helper antes de escalar uma crise, com possível override do painel."""
+        return valor_efetivo_int(
+            self._db, "crise_tempo_maximo_espera_helper_minutos", self._config.crise_tempo_maximo_espera_helper_minutos
+        )
+
+    def crise_escalada_automatica_ativa(self) -> bool:
+        """Se a escalada automática de crise está ativa, com possível override do painel."""
+        return valor_efetivo_bool(self._db, "crise_escalada_automatica", self._config.crise_escalada_automatica)
+
+    async def sessoes_aguardando_escalada(self) -> list[Sessao]:
+        """Sessões em crise, sem Helper, aguardando há mais tempo que o limite configurado."""
+        linhas = await self._db.sessoes_aguardando_escalada(self.crise_tempo_maximo_espera_efetivo())
+        return [Sessao.de_linha(linha) for linha in linhas]
+
+    async def marcar_escalada_enviada(self, session_id: int) -> None:
+        """Marca que a escalada automática já foi enviada, evitando reenvio a cada verificação."""
+        await self._db.marcar_escalada_enviada(session_id)
+
+    async def estatisticas_do_dashboard(self) -> dict:
+        """Reúne as contagens usadas pelo Dashboard do Painel MAIN e pelo /health."""
+        por_modo = await self._db.contar_sessoes_por_modo()
+        em_crise = await self._db.contar_sessoes_em_crise_abertas()
+        return {
+            "sessoes_em_ia": por_modo.get("ia", 0),
+            "sessoes_em_observador": por_modo.get("observador", 0),
+            "sessoes_em_cooperacao": por_modo.get("cooperacao", 0),
+            "sessoes_em_crise": em_crise,
+        }
+
     async def encerrar_definitivamente(
         self,
         sessao: Sessao,
@@ -265,10 +294,9 @@ class GerenciadorDeTickets:
         for informado) e apaga o canal privado.
         """
         mensagens = await self.obter_historico_bruto(sessao.id)
-        prompt_resumo_customizado = self._db.obter_configuracao("prompt_resumo") or ""
-        resumo = await summarizer.gerar_resumo(
-            ia, mensagens, modelo=config.modelo_resumo, prompt_resumo=prompt_resumo_customizado
-        )
+        # O prompt de resumo (PROMPT_RESUMO) nunca é lido do banco/painel —
+        # prompts internos ficam exclusivamente em prompts.py.
+        resumo = await summarizer.gerar_resumo(ia, mensagens, modelo=config.modelo_resumo)
         emocao_predominante = emotion.predominante(
             [m.get("emotion") for m in mensagens if m.get("role") == "user"]
         )

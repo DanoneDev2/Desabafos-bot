@@ -147,6 +147,54 @@ async def loop_fechamento_automatico(
         await asyncio.sleep(intervalo_segundos)
 
 
+async def loop_escalada_de_crise(
+    client: discord.Client,
+    db: Database,
+    tickets: GerenciadorDeTickets,
+    config: Config,
+) -> None:
+    """
+    Verifica periodicamente sessões em crise que ainda não têm um Helper
+    específico e já ultrapassaram o tempo máximo de espera configurado
+    (`CRISE_TEMPO_MAXIMO_ESPERA_HELPER_MINUTOS`): escala o alerta para o
+    canal de crise grave e/ou o cargo de Supervisor, uma única vez por
+    sessão (`escalada_enviada`).
+    """
+    while True:
+        await asyncio.sleep(60)  # checagem leve, a cada minuto — a query já filtra pelo tempo de espera real
+
+        if not tickets.crise_escalada_automatica_ativa():
+            continue
+
+        try:
+            pendentes = await tickets.sessoes_aguardando_escalada()
+            for sessao in pendentes:
+                canal_crise_id = config.canal_efetivo(db, "canal_crise_grave", config.canal_crise_grave)
+                supervisor_id = config.canal_efetivo(db, "supervisor_role_id", config.supervisor_role_id)
+                canal_crise = client.get_channel(canal_crise_id) if canal_crise_id else None
+                if canal_crise is None:
+                    log.watchdog(
+                        f"Escalada de crise pendente para a sessão #{sessao.id}, mas CANAL_CRISE_GRAVE "
+                        "não está configurado — configure-o no painel administrativo ou no .env."
+                    )
+                    await tickets.marcar_escalada_enviada(sessao.id)  # evita repetir o aviso no log a cada minuto
+                    continue
+
+                mencao_supervisor = f"<@&{supervisor_id}> " if supervisor_id else ""
+                try:
+                    await canal_crise.send(
+                        f"🚨 {mencao_supervisor}**Escalada de crise** — a sessão #{sessao.id} está aguardando "
+                        f"um Helper há mais de {tickets.crise_tempo_maximo_espera_efetivo()} minutos sem resposta."
+                    )
+                    await tickets.marcar_escalada_enviada(sessao.id)
+                    log.crise_escalada(sessao.id)
+                except Exception as exc:  # noqa: BLE001
+                    log.erro(f"Falha ao enviar a escalada de crise da sessão #{sessao.id}", exc)
+
+        except Exception as exc:  # noqa: BLE001 - o loop nunca pode morrer
+            log.erro("Falha no loop de escalada automática de crise", exc)
+
+
 def iniciar_tarefas_em_background(
     client: discord.Client,
     db: Database,
@@ -161,6 +209,10 @@ def iniciar_tarefas_em_background(
         asyncio.ensure_future(loop_limpeza(memoria, config)),
         asyncio.ensure_future(loop_watchdog(client, db, ia, config)),
         asyncio.ensure_future(loop_fechamento_automatico(client, tickets, ia, config)),
+        asyncio.ensure_future(loop_escalada_de_crise(client, db, tickets, config)),
     ]
-    log.info("Tarefas em background iniciadas: backup, limpeza, watchdog e fechamento automático de tickets.")
+    log.info(
+        "Tarefas em background iniciadas: backup, limpeza, watchdog, fechamento automático "
+        "de tickets e escalada automática de crise."
+    )
     return tarefas
